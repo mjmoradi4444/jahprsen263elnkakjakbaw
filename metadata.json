@@ -1,0 +1,6 @@
+{
+  "name": "پرتال یکپارچه پخش قطعات یدکی",
+  "description": "سامانه امن و یکپارچه مدیریت چرخه فروش تا تحویل، صندوق چک و مالی، و تامین ۵۰ برند قطعات یدکی خودرو با احراز هویت سرور، کنترل دسترسی نقش‌محور و تاریخچه اسناد.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
