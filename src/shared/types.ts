@@ -354,6 +354,12 @@ export interface CeoReport {
     /** Current pipeline snapshot (all open orders, ignores the date range). */
     pipelineByStage: Array<{ stage: number; label: string; count: number; amountToman: number }>;
     returnReasons: Array<{ reason: string; count: number }>;
+    /** Free-text reasons entered under «سایر», with their most repeated themes (computed on the server). */
+    otherReasons: {
+      count: number;
+      themes: Array<{ phrase: string; count: number; examples: string[] }>;
+      recent: Array<{ text: string; at: string; by: string; customer: string }>;
+    };
   };
   reps: CeoReportRepRow[];
   checks: {

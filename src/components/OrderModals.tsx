@@ -655,6 +655,9 @@ const RETURN_REASON_OPTIONS: Record<string, string[]> = {
     'نقص اطلاعات یا فایل پیش‌فاکتور',
   ],
 };
+// «سایر» is offered on every return; it requires the actual reason to be written.
+export const OTHER_RETURN_REASON = 'سایر';
+for (const k of Object.keys(RETURN_REASON_OPTIONS)) RETURN_REASON_OPTIONS[k].push(OTHER_RETURN_REASON);
 
 export function ReturnOrderModal({ order, target, onClose, onDone }: ReturnOrderModalProps) {
   const [reason, setReason] = useState('');
@@ -681,6 +684,7 @@ export function ReturnOrderModal({ order, target, onClose, onDone }: ReturnOrder
   if (!order || !target) return null;
 
   const options = RETURN_REASON_OPTIONS[target] || [];
+  const isOther = reason === OTHER_RETURN_REASON;
   const titles: Record<string, string> = {
     accounting: 'گزارش مغایرت انبار و برگشت به مالی',
     sales_mgr: 'مغایرت نرم‌افزار و عودت به مدیر فروش',
@@ -691,6 +695,10 @@ export function ReturnOrderModal({ order, target, onClose, onDone }: ReturnOrder
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!order || !target) return;
+    if (isOther && note.trim().length < 3) {
+      setError('دلیل اصلی برگشت را بنویسید.');
+      return;
+    }
     setError(null);
     setSubmitting(true);
     try {
@@ -751,15 +759,19 @@ export function ReturnOrderModal({ order, target, onClose, onDone }: ReturnOrder
 
           <div>
             <label htmlFor="ret-note" className="block text-xs font-bold text-slate-800 mb-1">
-              توضیحات تکمیلی
+              {isOther ? 'دلیل اصلی برگشت *' : 'توضیحات تکمیلی'}
             </label>
             <textarea
               id="ret-note"
-              rows={2}
+              rows={isOther ? 3 : 2}
+              required={isOther}
+              minLength={isOther ? 3 : undefined}
+              maxLength={500}
+              autoFocus={isOther}
               value={note}
               onChange={(e) => setNote(e.target.value)}
-              placeholder="جزئیات مغایرت یا اصلاح موردنیاز..."
-              className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
+              placeholder={isOther ? 'دلیل اصلی برگشت را دقیق بنویسید...' : 'جزئیات مغایرت یا اصلاح موردنیاز...'}
+              className={`w-full px-3 py-2 text-sm border rounded-lg ${isOther ? 'border-red-300 bg-red-50/30' : 'border-slate-300'}`}
             />
           </div>
 

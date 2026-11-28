@@ -277,3 +277,59 @@ test('warehouse supervisor sees only order/procurement events, with amounts mask
   const acc = await (await call('GET', '/logs?limit=100', tokens.accounting)).json();
   assert.ok(acc.items.some((i: { message: string }) => /[۰-۹]+\s*تومان/.test(i.message)), 'accounting sees amounts');
 });
+
+// ---------------- «سایر» return reason ----------------
+
+test('findReasonThemes surfaces the most repeated themes', async () => {
+  const { findReasonThemes } = await import('./reason-insights');
+  const themes = findReasonThemes([
+    'مشتری موجودی انبار را می‌خواهد',
+    'كد انبار اشتباه وارد شده',
+    'موجودی انبار کافی نیست',
+    'مشتری تماس نگرفت',
+    'آدرس تحویل اشتباه است',
+    'آدرس تحویل عوض شده',
+  ]);
+  const phrases = themes.map((t) => t.phrase);
+  assert.ok(phrases.includes('موجودی انبار'), phrases.join(','));
+  assert.ok(phrases.includes('آدرس تحویل'), phrases.join(','));
+  assert.equal(themes.find((t) => t.phrase === 'موجودی انبار')!.count, 2);
+  assert.equal(themes.find((t) => t.phrase === 'انبار')?.count ?? 3, 3);
+});
+
+test('«سایر» requires a written reason and is analysed in the CEO report', async () => {
+  const reasons = ['آدرس تحویل مشتری تغییر کرده', 'آدرس تحویل اشتباه ثبت شده', 'مشتری انصراف داد'];
+  for (const [i, text] of reasons.entries()) {
+    const c = await call('POST', '/orders', tokens.sales_2, {
+      customer: `مشتری سایر ${i}`,
+      proforma: `900${i}`,
+      amountToman: '1000000',
+      items: 'قطعه',
+    });
+    const o = (await c.json()).order;
+    if (i === 0) {
+      const bad = await call('POST', `/orders/${o.id}/return`, tokens.sales_mgr, {
+        expectedVersion: o.version,
+        target: 'sales',
+        reason: 'سایر',
+        note: '',
+      });
+      assert.equal(bad.status, 400);
+    }
+    const ok = await call('POST', `/orders/${o.id}/return`, tokens.sales_mgr, {
+      expectedVersion: o.version,
+      target: 'sales',
+      reason: 'سایر',
+      note: text,
+    });
+    assert.equal(ok.status, 200, await ok.clone().text());
+  }
+  const { report } = await (await call('GET', '/admin/reports/summary', tokens.ceo)).json();
+  assert.equal(report.orders.otherReasons.count, 3);
+  assert.equal(report.orders.returnReasons.find((r: { reason: string }) => r.reason === 'سایر').count, 3);
+  const theme = report.orders.otherReasons.themes.find((t: { phrase: string }) => t.phrase === 'آدرس تحویل');
+  assert.ok(theme, JSON.stringify(report.orders.otherReasons.themes));
+  assert.equal(theme.count, 2);
+  // Earlier returns are still counted after their order was revised.
+  assert.ok(report.orders.returnReasons.some((r: { reason: string }) => r.reason === 'اصلاح تعداد اقلام'));
+});

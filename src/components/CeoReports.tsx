@@ -411,7 +411,7 @@ export function CeoReports({ onNotify, refreshTrigger }: CeoReportsProps) {
             </ChartCard>
 
             {o.returnReasons.length > 0 && (
-              <ChartCard title="علت‌های برگشت سفارش" subtitle="در این بازه (تعداد)">
+              <ChartCard title="علت‌های برگشت سفارش" subtitle="همه برگشت‌های این بازه (تعداد)">
                 <HBarChart
                   ariaLabel="تعداد برگشت به تفکیک علت"
                   format={(n) => fa.format(n)}
@@ -419,6 +419,48 @@ export function CeoReports({ onNotify, refreshTrigger }: CeoReportsProps) {
                   rows={o.returnReasons.map((r) => ({ label: r.reason, values: [r.count] }))}
                 />
               </ChartCard>
+            )}
+            {o.otherReasons.count > 0 && (
+              <section className="bg-white border border-slate-200 rounded-xl p-4 min-w-0 lg:col-span-2">
+                <h2 className="text-sm font-extrabold text-slate-900">دلیل‌های پرتکرار در گزینه «سایر»</h2>
+                <p className="text-[11px] text-slate-500 mb-3">
+                  {fa.format(o.otherReasons.count)} برگشت با علت «سایر» در این بازه · موضوع‌هایی که در بیش از یک دلیل تکرار شده‌اند
+                </p>
+                {o.otherReasons.themes.length === 0 ? (
+                  <p className="text-xs text-slate-500">هنوز موضوع تکراری پیدا نشده است.</p>
+                ) : (
+                  <ul className="space-y-2 mb-4">
+                    {o.otherReasons.themes.map((t) => (
+                      <li key={t.phrase} className="text-xs">
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-slate-900">{t.phrase}</span>
+                          <span className="px-1.5 rounded bg-slate-100 text-slate-700 tabular-nums">{fa.format(t.count)} بار</span>
+                        </div>
+                        <div className="text-[11px] text-slate-500 mt-0.5">نمونه: {t.examples.join(' · ')}</div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <details className="text-xs">
+                  <summary className="cursor-pointer font-bold text-slate-700">متن کامل همه دلیل‌های «سایر»</summary>
+                  <div className="overflow-x-auto mt-2">
+                    <DataTable
+                      columns={[
+                        { key: 'at', label: 'تاریخ' },
+                        { key: 'by', label: 'ثبت‌کننده' },
+                        { key: 'customer', label: 'مشتری' },
+                        { key: 'text', label: 'دلیل' },
+                      ]}
+                      rows={o.otherReasons.recent.map((t) => ({
+                        at: faDate.format(new Date(t.at)),
+                        by: t.by,
+                        customer: t.customer,
+                        text: t.text,
+                      }))}
+                    />
+                  </div>
+                </details>
+              </section>
             )}
           </div>
 
@@ -510,7 +552,7 @@ export function CeoReports({ onNotify, refreshTrigger }: CeoReportsProps) {
                         <span className="text-slate-400"> #{r.rev}</span>
                       </span>
                     ),
-                    reason: r.returnReason,
+                    reason: r.returnReason === 'سایر' && r.returnNote ? `سایر: ${r.returnNote}` : r.returnReason,
                     changes: (
                       <div className="min-w-[240px]">
                         <RevisionDiffList diff={r.items} oldAmountToman={r.oldAmountToman} newAmountToman={r.newAmountToman} />

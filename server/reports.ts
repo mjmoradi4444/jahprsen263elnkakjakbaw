@@ -1,5 +1,6 @@
 import ExcelJS from 'exceljs';
 import { db, hydrateCheckRow, hydrateOrderRow, hydrateProcurementRow } from './db';
+import { findReasonThemes, OTHER_REASON } from './reason-insights';
 import { CeoReport, CeoReportRepRow, CeoRevisionRow, CheckRecord, OrderRecord, RevisionItemsDiff, STAGES } from '../src/shared/types';
 
 /**
@@ -242,11 +243,22 @@ export function buildCeoReport(range: ReportRange, now = new Date()): CeoReport 
     return { stage: s.id, label: s.short, count: atStage.length, amountToman: sum(atStage.map((o) => o.amountToman)) };
   });
 
+  // Return reasons come from every return event in the range (stage history), so a reason is still
+  // counted after the order was revised and its current return_reason cleared.
   const reasonCounts = new Map<string, number>();
-  for (const o of created.filter(wasReturned)) {
-    const reason = (o.returnReason || 'بدون علت ثبت‌شده').trim();
-    reasonCounts.set(reason, (reasonCounts.get(reason) || 0) + 1);
+  const otherTexts: Array<{ text: string; at: string; by: string; customer: string }> = [];
+  for (const o of orders) {
+    for (const h of o.stageHistory) {
+      const m = /^برگشت سفارش \((.*)\)$/.exec(h.action || '');
+      if (!m || !inRange(h.timestamp, range)) continue;
+      const reason = m[1].trim() || 'بدون علت ثبت‌شده';
+      reasonCounts.set(reason, (reasonCounts.get(reason) || 0) + 1);
+      if (reason === OTHER_REASON && h.note && h.note.trim() !== OTHER_REASON) {
+        otherTexts.push({ text: h.note.trim(), at: h.timestamp, by: h.actorName, customer: o.customer });
+      }
+    }
   }
+  otherTexts.sort((a, b) => b.at.localeCompare(a.at));
 
   // Checks submitted in range.
   const chk = checks.filter((c) => inRange(c.createdAt, range));
@@ -292,6 +304,11 @@ export function buildCeoReport(range: ReportRange, now = new Date()): CeoReport 
       cartonDiscrepancies: created.filter((o) => (o.cartonDiscrepancy || 0) !== 0).length,
       pipelineByStage,
       returnReasons: [...reasonCounts.entries()].map(([reason, count]) => ({ reason, count })).sort((a, b) => b.count - a.count),
+      otherReasons: {
+        count: otherTexts.length,
+        themes: findReasonThemes(otherTexts.map((t) => t.text)),
+        recent: otherTexts.slice(0, 30),
+      },
     },
     reps: [...reps.values()].sort((a, b) => b.amountCreatedToman - a.amountCreatedToman),
     checks: {
@@ -522,6 +539,30 @@ export async function buildReportWorkbook(range: ReportRange): Promise<Buffer> {
     });
   }
   styleSheet(cs);
+
+  // Return reasons, plus the most repeated themes among «سایر» free-text reasons
+  const rr = wb.addWorksheet('علت‌های برگشت');
+  rr.columns = [
+    { header: 'علت / موضوع پرتکرار', key: 'reason', width: 44 },
+    { header: 'تعداد', key: 'count', width: 10 },
+    { header: 'نمونه‌ها', key: 'ex', width: 70 },
+  ];
+  for (const r of report.orders.returnReasons) rr.addRow({ reason: safeText(r.reason), count: r.count });
+  if (report.orders.otherReasons.themes.length) {
+    rr.addRow({});
+    rr.addRow({ reason: 'موضوعات پرتکرار در علت‌های «سایر»' }).font = { bold: true };
+    for (const t of report.orders.otherReasons.themes) {
+      rr.addRow({ reason: safeText(t.phrase), count: t.count, ex: safeText(t.examples.join(' | ')) });
+    }
+  }
+  if (report.orders.otherReasons.recent.length) {
+    rr.addRow({});
+    rr.addRow({ reason: 'متن کامل علت‌های «سایر»' }).font = { bold: true };
+    for (const t of report.orders.otherReasons.recent) {
+      rr.addRow({ reason: safeText(t.text), ex: safeText(`${jalaliDateTime(t.at)} - ${t.by} - ${t.customer}`) });
+    }
+  }
+  styleSheet(rr);
 
   // Proforma revisions: one row per changed item (plus one row for amount-only revisions)
   const rv = wb.addWorksheet('مغایرت اصلاحیه‌ها');

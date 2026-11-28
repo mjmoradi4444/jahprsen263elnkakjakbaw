@@ -1584,6 +1584,10 @@ export function createApiRouter(): express.Router {
       res.status(400).json({ error: 'انتخاب علت برگشت الزامی است.' });
       return;
     }
+    if (reason === 'سایر' && (!String(req.body?.note || '').trim() || note.length < 3)) {
+      res.status(400).json({ error: 'برای علت «سایر»، دلیل اصلی برگشت را در کادر توضیحات بنویسید.' });
+      return;
+    }
 
     let nextStatus: OrderRecord['status'];
     let nextStage: number;
