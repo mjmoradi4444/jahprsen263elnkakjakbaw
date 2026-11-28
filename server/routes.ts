@@ -46,6 +46,7 @@ import {
 import { mirrorUsersAndSettingsToSupabase } from './supabase-restore';
 import { extractInvoiceFields } from './invoice-extract';
 import { deleteStoredFile } from './storage';
+import { getConfirmTargetHours, setConfirmTargetHours } from './sla';
 import { buildRevisionChanges, ComparableItem, parseItemsText, parseStoredItems } from './proforma-diff';
 import { buildCeoReport, buildReportWorkbook, parseReportRange } from './reports';
 import { listStoredBackups, resolveStoredBackup, restoreFromBackup, RestoreError, writeBackup } from './backup';
@@ -2455,6 +2456,11 @@ export function createApiRouter(): express.Router {
     });
   });
 
+  // SLA targets (read-only) so order cards can flag waiting orders that passed the target.
+  router.get('/sla', requireAuth, (_req: AuthedRequest, res) => {
+    res.json({ customerConfirmHours: getConfirmTargetHours() });
+  });
+
   router.get('/whatsapp-summary', requireAuth, requireRoles(LOG_VIEWER_ROLES, LOG_FORBIDDEN_MESSAGE), (req: AuthedRequest, res) => {
     const user = req.user!;
     const allOrders = (db.prepare(`SELECT * FROM orders ORDER BY updated_at DESC`).all() as Array<Record<string, unknown>>)
@@ -2561,6 +2567,17 @@ export function createApiRouter(): express.Router {
   // Backups contain every record and PIN hash; reports aggregate all reps' figures.
   const admin = express.Router();
   admin.use(requireAuth, requireRoles(['ceo'], 'این بخش فقط برای مدیرعامل در دسترس است.'));
+
+  admin.put('/sla', (req: AuthedRequest, res) => {
+    const hours = Number(normalizeDigits(String(req.body?.customerConfirmHours ?? '')));
+    if (!Number.isFinite(hours) || hours < 0.5 || hours > 720) {
+      res.status(400).json({ error: 'هدف زمانی باید بین نیم ساعت تا ۷۲۰ ساعت باشد.' });
+      return;
+    }
+    const saved = setConfirmTargetHours(hours);
+    addAuditLog(req.user!.id, req.user!.displayName, 'admin', `هدف زمانی اخذ تاییدیه مشتری روی ${saved} ساعت تنظیم شد.`);
+    res.json({ customerConfirmHours: saved });
+  });
 
   admin.get('/reports/summary', (req: AuthedRequest, res) => {
     const range = parseReportRange(req.query.from, req.query.to);

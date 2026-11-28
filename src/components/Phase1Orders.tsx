@@ -4,6 +4,7 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
+  Clock,
   Copy,
   FileText,
   MessageSquare,
@@ -13,6 +14,7 @@ import {
   Search,
   Upload,
 } from 'lucide-react';
+import { formatHours } from '../shared/format-hours';
 import { api, ApiError, LogsListResponse, WhatsAppSummaryResponse } from '../api/client';
 import { NewOrderForm } from './NewOrderForm';
 import { buildOrdersViewState, computeLatestCursor, mergeIncrementalRecords } from '../shared/sync';
@@ -43,6 +45,17 @@ interface Phase1OrdersProps {
 export function Phase1Orders({ user, roles, refreshTrigger, onNotify, onDataChanged }: Phase1OrdersProps) {
   const [subTab, setSubTab] = useState<'board' | 'new' | 'logs'>('board');
   // Events log & WhatsApp summary: CEO, accounting and warehouse supervisor only (enforced server-side too).
+  // SLA target for the "waiting for customer" badge, and a clock that refreshes it every minute.
+  const [slaTargetHours, setSlaTargetHours] = useState<number | null>(null);
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    api
+      .getSla()
+      .then((r) => setSlaTargetHours(r.customerConfirmHours))
+      .catch(() => {});
+    const t = setInterval(() => setNowTick(Date.now()), 60_000);
+    return () => clearInterval(t);
+  }, [refreshTrigger]);
   const canSeeLogs = user.id === 'ceo' || user.id === 'accounting' || user.id === 'warehouse_sup';
   const [filter, setFilter] = useState<string>(user.id === 'ceo' ? 'active' : 'mine');
   const [selectedStage, setSelectedStage] = useState<number | null>(null);
@@ -609,6 +622,25 @@ export function Phase1Orders({ user, roles, refreshTrigger, onNotify, onDataChan
                         )}
                       </div>
                     )}
+
+                    {/* SLA: waiting for the customer's confirmation since the sales manager approved */}
+                    {order.status === 'active' && order.stage === 3 && (() => {
+                      const since = [...order.stageHistory].reverse().find((h) => h.stage === 2 && h.action === 'تایید مدیر فروش');
+                      if (!since) return null;
+                      const hours = (nowTick - Date.parse(since.timestamp)) / 3_600_000;
+                      const over = slaTargetHours !== null && hours > slaTargetHours;
+                      return (
+                        <div
+                          className={`p-2.5 rounded-lg border text-xs flex items-center gap-2 ${
+                            over ? 'bg-red-50 border-red-200 text-red-800 font-bold' : 'bg-sky-50 border-sky-200 text-sky-900'
+                          }`}
+                        >
+                          <Clock className="w-3.5 h-3.5 shrink-0" />
+                          منتظر تاییدیه مشتری: {formatHours(hours)}
+                          {slaTargetHours !== null && (over ? ` — از هدف ${formatHours(slaTargetHours)} گذشته` : ` (هدف: ${formatHours(slaTargetHours)})`)}
+                        </div>
+                      );
+                    })()}
 
                     {/* Carton Discrepancy Alert */}
                     {order.cartonDiscrepancy !== 0 && (

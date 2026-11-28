@@ -333,3 +333,87 @@ test('«سایر» requires a written reason and is analysed in the CEO report',
   // Earlier returns are still counted after their order was revised.
   assert.ok(report.orders.returnReasons.some((r: { reason: string }) => r.reason === 'اصلاح تعداد اقلام'));
 });
+
+// ---------------- SLA: customer confirmation time ----------------
+
+test('confirmCycles handles confirm, reject-and-retry and open cycles', async () => {
+  const { confirmCycles } = await import('./sla');
+  const h = (stage: number, action: string, t: string) => ({ stage, action, actorName: 'x', timestamp: t });
+  const order = {
+    id: 'o1',
+    proforma: '1',
+    customer: 'c',
+    salesOwnerId: 'sales_1',
+    salesOwnerName: 'r',
+    stage: 3,
+    status: 'active',
+    stageHistory: [
+      h(2, 'تایید مدیر فروش', '2026-01-01T08:00:00Z'),
+      h(3, 'برگشت سفارش (عدم تایید مشتری)', '2026-01-01T12:00:00Z'),
+      h(2, 'تایید مدیر فروش', '2026-01-02T08:00:00Z'),
+      h(3, 'ثبت تاییدیه مشتری', '2026-01-02T11:30:00Z'),
+      h(2, 'تایید مدیر فروش', '2026-01-03T08:00:00Z'),
+    ],
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const cycles = confirmCycles(order as any, new Date('2026-01-03T10:00:00Z'));
+  assert.deepEqual(
+    cycles.map((c) => [c.outcome, c.hours]),
+    [
+      ['rejected', 4],
+      ['confirmed', 3.5],
+      ['open', 2],
+    ],
+  );
+});
+
+test('SLA report: medians, target share, waiting list; only the CEO can set the target', async () => {
+  const mk = async (proforma: string, approveHoursAgo: number, confirmHoursAgo: number | null) => {
+    const c = await call('POST', '/orders', tokens.sales_3, { customer: `مشتری SLA ${proforma}`, proforma, amountToman: '1000000', items: 'قطعه' });
+    let o = (await c.json()).order;
+    o = (await (await call('POST', `/orders/${o.id}/advance`, tokens.sales_mgr, { expectedVersion: o.version })).json()).order;
+    if (confirmHoursAgo !== null) {
+      const r = await call('POST', `/orders/${o.id}/advance`, tokens.sales_3, { expectedVersion: o.version });
+      assert.equal(r.status, 200, await r.clone().text());
+    }
+    // Move the history back in time to simulate real waiting periods.
+    const row = db.prepare(`SELECT stage_history_json FROM orders WHERE id = ?`).get(o.id);
+    const hist = JSON.parse(row.stage_history_json);
+    const ago = (hrs: number) => new Date(Date.now() - hrs * 3_600_000).toISOString();
+    for (const e of hist) {
+      if (e.action === 'تایید مدیر فروش') e.timestamp = ago(approveHoursAgo);
+      if (e.action === 'ثبت تاییدیه مشتری') e.timestamp = ago(confirmHoursAgo!);
+    }
+    db.prepare(`UPDATE orders SET stage_history_json = ? WHERE id = ?`).run(JSON.stringify(hist), o.id);
+  };
+  await mk('7701', 10, 8); // 2h
+  await mk('7702', 40, 10); // 30h
+  await mk('7703', 50, 46); // 4h
+  await mk('7704', 30, null); // waiting 30h -> overdue at 24h target
+
+  for (const role of STAFF) {
+    assert.equal((await call('PUT', '/admin/sla', tokens[role], { customerConfirmHours: 5 })).status, 403, role);
+  }
+  assert.equal((await call('GET', '/sla', tokens.sales_3)).status, 200);
+  assert.equal((await (await call('GET', '/sla', tokens.sales_3)).json()).customerConfirmHours, 24);
+
+  const { report } = await (await call('GET', '/admin/reports/summary', tokens.ceo)).json();
+  const sla = report.customerConfirm;
+  assert.equal(sla.targetHours, 24);
+  const mine = sla.byRep.find((r: { salesOwnerId: string }) => r.salesOwnerId === 'sales_3');
+  assert.equal(mine.confirmed, 3);
+  assert.equal(mine.medianHours, 4);
+  assert.equal(mine.withinTargetPct, 67);
+  assert.equal(mine.waiting, 1);
+  assert.equal(mine.overdue, 1);
+  const w = sla.waiting.find((x: { proforma: string }) => x.proforma === '7704');
+  assert.ok(w && w.overdue && Math.round(w.hours) === 30);
+
+  // CEO tightens the target: 3h -> only the 2h confirmation is within it.
+  const put = await call('PUT', '/admin/sla', tokens.ceo, { customerConfirmHours: '۳' });
+  assert.equal(put.status, 200);
+  assert.equal((await call('PUT', '/admin/sla', tokens.ceo, { customerConfirmHours: 0 })).status, 400);
+  const { report: r2 } = await (await call('GET', '/admin/reports/summary', tokens.ceo)).json();
+  assert.equal(r2.customerConfirm.byRep.find((r: { salesOwnerId: string }) => r.salesOwnerId === 'sales_3').withinTargetPct, 33);
+  assert.equal((await (await call('GET', '/sla', tokens.sales_3)).json()).customerConfirmHours, 3);
+});

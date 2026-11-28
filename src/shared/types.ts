@@ -390,6 +390,8 @@ export interface CeoReport {
   byChannel: Array<{ label: string; count: number; amountToman: number }>;
   byPayment: Array<{ label: string; count: number; amountToman: number }>;
   topCustomers: Array<{ customer: string; orders: number; amountToman: number; delivered: number }>;
+  /** SLA: time from sales-manager approval to the customer confirmation being sent to accounting. */
+  customerConfirm: CustomerConfirmSla;
   /** Proforma revisions in the range, with item / quantity / price / amount differences. */
   revisions: {
     count: number;
@@ -398,6 +400,43 @@ export interface CeoReport {
     amountDeltaToman: number;
     items: CeoRevisionRow[];
   };
+}
+
+export interface CustomerConfirmSla {
+  /** Target in hours, set by the CEO. */
+  targetHours: number;
+  /** Cycles that ended in the range. */
+  confirmed: number;
+  rejected: number;
+  medianHours: number | null;
+  avgHours: number | null;
+  p90Hours: number | null;
+  /** Share of confirmations done within the target (0-100). */
+  withinTargetPct: number | null;
+  distribution: Array<{ label: string; count: number }>;
+  byRep: Array<{
+    salesOwnerId: string;
+    salesOwnerName: string;
+    confirmed: number;
+    rejected: number;
+    medianHours: number | null;
+    avgHours: number | null;
+    withinTargetPct: number | null;
+    waiting: number;
+    overdue: number;
+  }>;
+  /** Weekly median (Saturday-start weeks, Tehran) of confirmations in the range. */
+  trend: Array<{ weekStart: string; medianHours: number; count: number }>;
+  /** Orders waiting for the customer right now (independent of the range), longest first. */
+  waiting: Array<{
+    orderId: string;
+    proforma: string;
+    customer: string;
+    salesOwnerName: string;
+    startedAt: string;
+    hours: number;
+    overdue: boolean;
+  }>;
 }
 
 export interface RevisionItemRef {

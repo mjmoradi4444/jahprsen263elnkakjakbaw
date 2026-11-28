@@ -446,6 +446,8 @@ export const api = {
     }),
 
   getLogs: (page = 1, limit = 30) => apiRequest<LogsListResponse>(`/api/logs?page=${page}&limit=${limit}`),
+  getSla: () => apiRequest<{ customerConfirmHours: number }>('/api/sla'),
+
   getWhatsAppSummary: () => apiRequest<WhatsAppSummaryResponse>('/api/whatsapp-summary'),
 
   getSettings: () => apiRequest<SettingsResponse>('/api/settings'),
@@ -507,6 +509,12 @@ function rangeQuery(from: string | null, to: string | null): string {
 }
 
 export const adminApi = {
+  setSla: (customerConfirmHours: number) =>
+    apiRequest<{ customerConfirmHours: number }>('/api/admin/sla', {
+      method: 'PUT',
+      body: JSON.stringify({ customerConfirmHours }),
+    }),
+
   getReport: (from: string | null, to: string | null) =>
     apiRequest<{ report: CeoReport }>(`/api/admin/reports/summary${rangeQuery(from, to)}`),
 

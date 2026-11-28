@@ -1,7 +1,8 @@
 import ExcelJS from 'exceljs';
 import { db, hydrateCheckRow, hydrateOrderRow, hydrateProcurementRow } from './db';
 import { findReasonThemes, OTHER_REASON } from './reason-insights';
-import { CeoReport, CeoReportRepRow, CeoRevisionRow, CheckRecord, OrderRecord, RevisionItemsDiff, STAGES } from '../src/shared/types';
+import { ConfirmCycle, confirmCycles, getConfirmTargetHours, percentile, round1 } from './sla';
+import { CustomerConfirmSla, CeoReport, CeoReportRepRow, CeoRevisionRow, CheckRecord, OrderRecord, RevisionItemsDiff, STAGES } from '../src/shared/types';
 
 /**
  * CEO reports. Every function here reads ALL records with no role filtering, so the routes that
@@ -192,6 +193,85 @@ function hasItemChanges(d: RevisionItemsDiff): boolean {
   return d.added.length + d.removed.length + d.qtyChanged.length + d.priceChanged.length > 0;
 }
 
+export function buildCustomerConfirmSla(orders: OrderRecord[], range: ReportRange, now: Date): CustomerConfirmSla {
+  const target = getConfirmTargetHours();
+  const all: ConfirmCycle[] = orders.flatMap((o) => confirmCycles(o, now));
+  const ended = all.filter((c) => c.outcome !== 'open' && inRange(c.endedAt, range));
+  const confirmed = ended.filter((c) => c.outcome === 'confirmed');
+  const open = all.filter((c) => c.outcome === 'open');
+  const hrs = (cs: ConfirmCycle[]) => cs.map((c) => c.hours).filter((h) => Number.isFinite(h) && h >= 0);
+  const within = (cs: ConfirmCycle[]) => {
+    const h = hrs(cs);
+    return h.length ? Math.round((h.filter((x) => x <= target).length / h.length) * 100) : null;
+  };
+  const avg = (h: number[]) => (h.length ? h.reduce((a, b) => a + b, 0) / h.length : null);
+
+  const buckets: Array<{ label: string; max: number }> = [
+    { label: 'تا ۲ ساعت', max: 2 },
+    { label: '۲ تا ۸ ساعت', max: 8 },
+    { label: '۸ تا ۲۴ ساعت', max: 24 },
+    { label: '۱ تا ۳ روز', max: 72 },
+    { label: 'بیش از ۳ روز', max: Infinity },
+  ];
+  const distribution = buckets.map((b, i) => ({
+    label: b.label,
+    count: hrs(confirmed).filter((h) => h <= b.max && (i === 0 || h > buckets[i - 1].max)).length,
+  }));
+
+  const repIds = new Set([...ended, ...open].map((c) => c.salesOwnerId));
+  const byRep = [...repIds].map((id) => {
+    const mine = confirmed.filter((c) => c.salesOwnerId === id);
+    const waitingMine = open.filter((c) => c.salesOwnerId === id);
+    const any = [...ended, ...open].find((c) => c.salesOwnerId === id)!;
+    return {
+      salesOwnerId: id,
+      salesOwnerName: any.salesOwnerName,
+      confirmed: mine.length,
+      rejected: ended.filter((c) => c.salesOwnerId === id && c.outcome === 'rejected').length,
+      medianHours: round1(percentile(hrs(mine), 0.5)),
+      avgHours: round1(avg(hrs(mine))),
+      withinTargetPct: within(mine),
+      waiting: waitingMine.length,
+      overdue: waitingMine.filter((c) => c.hours > target).length,
+    };
+  });
+  byRep.sort((a, b) => (b.medianHours ?? -1) - (a.medianHours ?? -1));
+
+  const weeks = new Map<string, number[]>();
+  for (const c of confirmed) {
+    const k = new Date(tehranWeekStart(Date.parse(c.endedAt!))).toISOString();
+    weeks.set(k, [...(weeks.get(k) || []), c.hours]);
+  }
+  const trend = [...weeks.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([weekStart, h]) => ({ weekStart, medianHours: round1(percentile(h, 0.5)) as number, count: h.length }));
+
+  return {
+    targetHours: target,
+    confirmed: confirmed.length,
+    rejected: ended.length - confirmed.length,
+    medianHours: round1(percentile(hrs(confirmed), 0.5)),
+    avgHours: round1(avg(hrs(confirmed))),
+    p90Hours: round1(percentile(hrs(confirmed), 0.9)),
+    withinTargetPct: within(confirmed),
+    distribution,
+    byRep,
+    trend,
+    waiting: open
+      .sort((a, b) => b.hours - a.hours)
+      .slice(0, 50)
+      .map((c) => ({
+        orderId: c.orderId,
+        proforma: c.proforma,
+        customer: c.customer,
+        salesOwnerName: c.salesOwnerName,
+        startedAt: c.startedAt,
+        hours: round1(c.hours) as number,
+        overdue: c.hours > target,
+      })),
+  };
+}
+
 export function buildCeoReport(range: ReportRange, now = new Date()): CeoReport {
   const { orders, checks } = loadAll();
 
@@ -341,6 +421,7 @@ export function buildCeoReport(range: ReportRange, now = new Date()): CeoReport 
       }
       return [...m.values()].sort((a, b) => b.amountToman - a.amountToman).slice(0, 10);
     })(),
+    customerConfirm: buildCustomerConfirmSla(orders, range, now),
     revisions: (() => {
       const revs = loadRevisions(range);
       return {
@@ -433,6 +514,8 @@ export async function buildReportWorkbook(range: ReportRange): Promise<Buffer> {
     { k: 'سفارش‌های دارای برگشت', v: report.orders.returned },
     { k: 'سفارش‌های در جریان', v: report.orders.inProgress },
     { k: 'میانگین زمان ثبت تا تحویل (ساعت)', v: report.orders.avgDeliveryHours ?? '-' },
+    { k: 'میانه زمان اخذ تاییدیه مشتری (ساعت)', v: report.customerConfirm.medianHours ?? '-' },
+    { k: `تاییدیه‌های مشتری در هدف ${report.customerConfirm.targetHours} ساعت (٪)`, v: report.customerConfirm.withinTargetPct ?? '-' },
     { k: 'مغایرت کارتن', v: report.orders.cartonDiscrepancies },
     { k: 'چک/واریزی ثبت‌شده', v: report.checks.submitted },
     { k: 'مبلغ چک/واریزی ثبت‌شده (تومان)', v: report.checks.amountSubmittedToman },
@@ -539,6 +622,37 @@ export async function buildReportWorkbook(range: ReportRange): Promise<Buffer> {
     });
   }
   styleSheet(cs);
+
+  // SLA: customer confirmation time, one row per cycle that ended in the range + waiting ones
+  const sl = wb.addWorksheet('زمان تاییدیه مشتری');
+  sl.columns = [
+    { header: 'وضعیت', key: 'outcome', width: 16 },
+    { header: 'کارشناس', key: 'rep', width: 18 },
+    { header: 'مشتری', key: 'customer', width: 24 },
+    { header: 'پیش‌فاکتور', key: 'proforma', width: 14 },
+    { header: 'تایید مدیر فروش', key: 'start', width: 18 },
+    { header: 'ارسال به حسابداری / برگشت', key: 'end', width: 22 },
+    { header: 'مدت (ساعت)', key: 'hours', width: 12, style: { numFmt: '0.0' } },
+    { header: `در هدف (${report.customerConfirm.targetHours} ساعت)`, key: 'ok', width: 16 },
+  ];
+  const slaCycles = orders
+    .flatMap((o) => confirmCycles(o))
+    .filter((c) => c.outcome === 'open' || inRange(c.endedAt, range))
+    .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+  const outcomeLabel = { confirmed: 'تایید مشتری', rejected: 'عدم تایید مشتری', open: 'در انتظار مشتری' } as const;
+  for (const c of slaCycles) {
+    sl.addRow({
+      outcome: outcomeLabel[c.outcome],
+      rep: safeText(c.salesOwnerName),
+      customer: safeText(c.customer),
+      proforma: safeText(c.proforma),
+      start: jalaliDateTime(c.startedAt),
+      end: c.endedAt ? jalaliDateTime(c.endedAt) : '-',
+      hours: Math.round(c.hours * 10) / 10,
+      ok: c.hours <= report.customerConfirm.targetHours ? 'بله' : 'خیر',
+    });
+  }
+  styleSheet(sl);
 
   // Return reasons, plus the most repeated themes among «سایر» free-text reasons
   const rr = wb.addWorksheet('علت‌های برگشت');

@@ -3,6 +3,7 @@ import { AlertTriangle, BarChart3, CheckCircle2, Clock, FileSpreadsheet, Hourgla
 import { adminApi, ApiError } from '../api/client';
 import { CeoReport } from '../shared/types';
 import { diffCount, RevisionDiffList } from './RevisionDiff';
+import { CustomerConfirmSlaSection } from './CustomerConfirmSla';
 import { CHART, ChartCard, compactToman, DataTable, fullToman, HBarChart, Legend, LineChart, SegmentedBar } from './charts';
 
 /**
@@ -222,6 +223,8 @@ export function CeoReports({ onNotify, refreshTrigger }: CeoReportsProps) {
               ]}
             />
           </ChartCard>
+
+          <CustomerConfirmSlaSection sla={report.customerConfirm} onTargetSaved={loadReport} onNotify={onNotify} />
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             {/* Reps */}

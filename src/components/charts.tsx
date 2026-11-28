@@ -135,11 +135,13 @@ export function LineChart({
   series,
   height = 240,
   ariaLabel,
+  format = compactToman,
 }: {
   labels: string[];
   series: LineSeries[];
   height?: number;
   ariaLabel: string;
+  format?: (n: number) => string;
 }) {
   const [wrapRef, width] = useWidth<HTMLDivElement>();
   const [hover, setHover] = useState<number | null>(null);
@@ -176,7 +178,7 @@ export function LineChart({
               <span aria-hidden className="inline-block w-3 h-0.5 rounded" style={{ background: s.color }} />
               {s.label}
             </span>
-            <span className="font-bold text-slate-900 tabular-nums">{compactToman(s.values[hover] || 0)}</span>
+            <span className="font-bold text-slate-900 tabular-nums">{format(s.values[hover] || 0)}</span>
           </div>
         ))}
       </div>
@@ -204,7 +206,7 @@ export function LineChart({
           <g key={t}>
             <line x1={pad.left} x2={width - pad.right} y1={y(t)} y2={y(t)} stroke={t === 0 ? CHART.axis : CHART.grid} strokeWidth={1} />
             <text x={pad.left - 8} y={y(t)} textAnchor="end" dominantBaseline="middle" fontSize={10} fill={CHART.inkSecondary}>
-              {compactToman(t)}
+              {format(t)}
             </text>
           </g>
         ))}
