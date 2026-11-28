@@ -1,6 +1,7 @@
 import React, { Suspense, lazy, useCallback, useEffect, useState } from 'react';
 import {
   BarChart3,
+  DatabaseBackup,
   Factory,
   Landmark,
   LogOut,
@@ -20,9 +21,10 @@ import { UserAccountPublic } from './shared/types';
 
 // CEO-only module: loaded on demand, so other roles never even download this code.
 // (Access is enforced by the server; this only keeps it out of everyone else's UI.)
-const CeoAdmin = lazy(() => import('./components/CeoAdmin').then((m) => ({ default: m.CeoAdmin })));
+const CeoReports = lazy(() => import('./components/CeoReports').then((m) => ({ default: m.CeoReports })));
+const CeoBackups = lazy(() => import('./components/CeoBackups').then((m) => ({ default: m.CeoBackups })));
 
-type PhaseId = 1 | 2 | 3 | 4;
+type PhaseId = 1 | 2 | 3 | 4 | 5;
 
 export default function App() {
   const [bootLoading, setBootLoading] = useState(true);
@@ -116,7 +118,9 @@ export default function App() {
         ? 'مالی و صندوق چک‌ها (فاز ۲)'
         : activePhase === 3
           ? 'تامین ۵۰ برند (فاز ۳)'
-          : 'گزارش‌های مدیریتی و پشتیبان‌گیری';
+          : activePhase === 4
+            ? 'گزارش‌های مدیریتی'
+            : 'پشتیبان‌گیری و بازگردانی اطلاعات';
 
   const navItems: Array<{ id: PhaseId; label: string; sub: string; icon: React.ReactNode; visible: boolean }> = [
     {
@@ -142,9 +146,16 @@ export default function App() {
     },
     {
       id: 4,
-      label: 'گزارش‌ها و پشتیبان',
-      sub: 'ویژه مدیرعامل',
+      label: 'گزارش‌های مدیریتی',
+      sub: 'نمودار و جدول · ویژه مدیرعامل',
       icon: <BarChart3 className="w-4 h-4 shrink-0" />,
+      visible: user.id === 'ceo',
+    },
+    {
+      id: 5,
+      label: 'پشتیبان‌گیری',
+      sub: 'دانلود و بازگردانی · ویژه مدیرعامل',
+      icon: <DatabaseBackup className="w-4 h-4 shrink-0" />,
       visible: user.id === 'ceo',
     },
   ];
@@ -152,13 +163,13 @@ export default function App() {
   return (
     <div className="min-h-screen bg-slate-50 flex">
       {/* Desktop Sidebar */}
-      <aside className="hidden lg:flex lg:flex-col w-64 shrink-0 bg-white border-l border-slate-200 no-print">
+      <aside className="hidden lg:flex lg:flex-col w-64 shrink-0 bg-white border-l border-slate-200 no-print lg:sticky lg:top-0 lg:h-screen lg:self-start">
         <div className="px-5 py-4 border-b border-slate-200">
           <div className="text-sm font-extrabold text-slate-900">پرتال پخش قطعات یدکی</div>
           <div className="text-[11px] text-slate-500 mt-0.5">ایران‌خودرو و سایپا · ۵۰ برند</div>
         </div>
 
-        <nav className="flex-1 p-3 space-y-1" aria-label="ماژول‌های سامانه">
+        <nav className="flex-1 min-h-0 overflow-y-auto p-3 space-y-1" aria-label="ماژول‌های سامانه">
           {navItems
             .filter((item) => item.visible)
             .map((item) => {
@@ -186,7 +197,7 @@ export default function App() {
             })}
         </nav>
 
-        <div className="p-4 border-t border-slate-200 space-y-3">
+        <div className="p-4 border-t border-slate-200 space-y-3 shrink-0 bg-white">
           <div>
             <div className="text-xs font-extrabold text-slate-900 truncate">{user.displayName}</div>
             <div className="text-[11px] text-slate-500 truncate">{user.roleLabel}</div>
@@ -229,7 +240,7 @@ export default function App() {
                 <X className="w-4 h-4" />
               </button>
             </div>
-            <nav className="flex-1 p-3 space-y-1">
+            <nav className="flex-1 min-h-0 overflow-y-auto p-3 space-y-1">
               {navItems
                 .filter((item) => item.visible)
                 .map((item) => (
@@ -347,7 +358,12 @@ export default function App() {
           )}
           {activePhase === 4 && user.id === 'ceo' && (
             <Suspense fallback={<div className="text-sm text-slate-600">در حال بارگذاری...</div>}>
-              <CeoAdmin onNotify={showToast} refreshTrigger={refreshTrigger} />
+              <CeoReports onNotify={showToast} refreshTrigger={refreshTrigger} />
+            </Suspense>
+          )}
+          {activePhase === 5 && user.id === 'ceo' && (
+            <Suspense fallback={<div className="text-sm text-slate-600">در حال بارگذاری...</div>}>
+              <CeoBackups onNotify={showToast} />
             </Suspense>
           )}
         </main>

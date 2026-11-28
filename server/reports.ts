@@ -49,6 +49,113 @@ function loadAll(): { orders: OrderRecord[]; checks: CheckRecord[] } {
   return { orders, checks };
 }
 
+// ==================== Time buckets (Tehran time, Jalali labels) ====================
+
+const TEHRAN_OFFSET_MS = 3.5 * 3_600_000; // Iran has no DST since 2022
+const DAY_MS = 86_400_000;
+const MAX_TIMELINE_BUCKETS = 400;
+
+function tehranMidnight(ms: number): number {
+  const local = ms + TEHRAN_OFFSET_MS;
+  return local - (((local % DAY_MS) + DAY_MS) % DAY_MS) - TEHRAN_OFFSET_MS;
+}
+
+const persianParts = new Intl.DateTimeFormat('en-US-u-ca-persian-nu-latn', {
+  timeZone: 'Asia/Tehran',
+  year: 'numeric',
+  month: 'numeric',
+  day: 'numeric',
+});
+function persianYmd(ms: number): { y: number; m: number; d: number } {
+  const parts = persianParts.formatToParts(new Date(ms));
+  const get = (t: string) => Number(parts.find((p) => p.type === t)?.value || 0);
+  return { y: get('year'), m: get('month'), d: get('day') };
+}
+const FA_MONTHS = ['فروردین', 'اردیبهشت', 'خرداد', 'تیر', 'مرداد', 'شهریور', 'مهر', 'آبان', 'آذر', 'دی', 'بهمن', 'اسفند'];
+const toFaDigits = (s: string) => s.replace(/\d/g, (d) => '۰۱۲۳۴۵۶۷۸۹'[Number(d)]);
+
+/** Persian week starts on Saturday. */
+function tehranWeekStart(ms: number): number {
+  const mid = tehranMidnight(ms);
+  const weekday = new Date(mid + TEHRAN_OFFSET_MS).getUTCDay(); // 0=Sun..6=Sat in Tehran local
+  const sinceSaturday = (weekday + 1) % 7;
+  return mid - sinceSaturday * DAY_MS;
+}
+
+function bucketKey(ms: number, g: 'day' | 'week' | 'month'): string {
+  if (g === 'day') return String(tehranMidnight(ms));
+  if (g === 'week') return String(tehranWeekStart(ms));
+  const { y, m } = persianYmd(ms);
+  return `${y}-${String(m).padStart(2, '0')}`;
+}
+
+function bucketLabel(startMs: number, g: 'day' | 'week' | 'month'): string {
+  const { y, m, d } = persianYmd(startMs);
+  if (g === 'month') return `${FA_MONTHS[m - 1]} ${toFaDigits(String(y).slice(2))}`;
+  return toFaDigits(`${String(m).padStart(2, '0')}/${String(d).padStart(2, '0')}`);
+}
+
+function buildTimeline(
+  orders: OrderRecord[],
+  range: ReportRange,
+  now: Date,
+): CeoReport['timeline'] {
+  const createdTimes = orders.map((o) => Date.parse(o.createdAt)).filter(Number.isFinite);
+  const startMs = range.from ? Date.parse(range.from) : createdTimes.length ? Math.min(...createdTimes) : now.getTime();
+  const endMs = range.to ? Date.parse(range.to) - 1 : now.getTime();
+  const spanDays = Math.max(1, Math.ceil((endMs - startMs) / DAY_MS));
+  const granularity: 'day' | 'week' | 'month' = spanDays <= 31 ? 'day' : spanDays <= 120 ? 'week' : 'month';
+
+  // Every bucket in the range, including empty ones, in chronological order.
+  const points = new Map<string, CeoReport['timeline']['points'][number]>();
+  let cursor = granularity === 'week' ? tehranWeekStart(startMs) : tehranMidnight(startMs);
+  while (cursor <= endMs && points.size < MAX_TIMELINE_BUCKETS) {
+    const key = bucketKey(cursor, granularity);
+    if (!points.has(key)) {
+      points.set(key, {
+        key,
+        label: bucketLabel(cursor, granularity),
+        createdCount: 0,
+        createdAmountToman: 0,
+        deliveredCount: 0,
+        deliveredAmountToman: 0,
+      });
+    }
+    cursor += granularity === 'week' ? 7 * DAY_MS : DAY_MS;
+  }
+
+  for (const o of orders) {
+    if (inRange(o.createdAt, range)) {
+      const p = points.get(bucketKey(Date.parse(o.createdAt), granularity));
+      if (p) {
+        p.createdCount++;
+        p.createdAmountToman += o.amountToman || 0;
+      }
+    }
+    const dAt = deliveredAt(o);
+    if (dAt && inRange(dAt, range)) {
+      const p = points.get(bucketKey(Date.parse(dAt), granularity));
+      if (p) {
+        p.deliveredCount++;
+        p.deliveredAmountToman += o.amountToman || 0;
+      }
+    }
+  }
+  return { granularity, points: [...points.values()] };
+}
+
+function groupOrders(orders: OrderRecord[], pick: (o: OrderRecord) => string) {
+  const m = new Map<string, { label: string; count: number; amountToman: number }>();
+  for (const o of orders) {
+    const label = (pick(o) || 'نامشخص').trim() || 'نامشخص';
+    const g = m.get(label) || { label, count: 0, amountToman: 0 };
+    g.count++;
+    g.amountToman += o.amountToman || 0;
+    m.set(label, g);
+  }
+  return [...m.values()].sort((a, b) => b.amountToman - a.amountToman);
+}
+
 export function buildCeoReport(range: ReportRange, now = new Date()): CeoReport {
   const { orders, checks } = loadAll();
 
@@ -167,6 +274,21 @@ export function buildCeoReport(range: ReportRange, now = new Date()): CeoReport 
       open: procurement.length,
       urgentOpen: procurement.filter((p) => p.priority === 'فوری').length,
     },
+    timeline: buildTimeline(orders, range, now),
+    byChannel: groupOrders(created, (o) => o.channel),
+    byPayment: groupOrders(created, (o) => o.payment || ''),
+    topCustomers: (() => {
+      const m = new Map<string, { customer: string; orders: number; amountToman: number; delivered: number }>();
+      for (const o of created) {
+        const key = o.customer.trim();
+        const c = m.get(key) || { customer: key, orders: 0, amountToman: 0, delivered: 0 };
+        c.orders++;
+        c.amountToman += o.amountToman || 0;
+        if (o.stage >= 7) c.delivered++;
+        m.set(key, c);
+      }
+      return [...m.values()].sort((a, b) => b.amountToman - a.amountToman).slice(0, 10);
+    })(),
   };
 }
 

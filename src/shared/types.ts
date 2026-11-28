@@ -362,6 +362,21 @@ export interface CeoReport {
     upcomingDue: Array<{ id: string; customer: string; amountToman: number; dueDate: string; sayadiId: string; salesOwnerName: string; status: string }>;
   };
   procurement: { open: number; urgentOpen: number };
+  /** Time series over the range: day buckets up to 31 days, weeks up to ~4 months, Jalali months beyond. */
+  timeline: {
+    granularity: 'day' | 'week' | 'month';
+    points: Array<{
+      key: string;
+      label: string;
+      createdCount: number;
+      createdAmountToman: number;
+      deliveredCount: number;
+      deliveredAmountToman: number;
+    }>;
+  };
+  byChannel: Array<{ label: string; count: number; amountToman: number }>;
+  byPayment: Array<{ label: string; count: number; amountToman: number }>;
+  topCustomers: Array<{ customer: string; orders: number; amountToman: number; delivered: number }>;
 }
 
 export interface StoredBackupInfoDto {
