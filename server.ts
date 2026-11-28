@@ -4,6 +4,7 @@ import path from 'node:path';
 import { createServer as createViteServer } from 'vite';
 import { createApiRouter } from './server/routes';
 import { mirrorUsersAndSettingsToSupabase, restoreFromSupabaseIfEmpty } from './server/supabase-restore';
+import { startDailyBackupScheduler } from './server/backup';
 
 const PORT = Number(process.env.PORT || 3000);
 
@@ -17,6 +18,8 @@ async function startServer(): Promise<void> {
   // If the disk was wiped (host without persistent storage), pull data back from Supabase first.
   await restoreFromSupabaseIfEmpty();
   void mirrorUsersAndSettingsToSupabase();
+  // One automatic full backup per Tehran day in DATA_DIR/backups (newest 7 kept).
+  startDailyBackupScheduler();
 
   const app = express();
   app.disable('x-powered-by');

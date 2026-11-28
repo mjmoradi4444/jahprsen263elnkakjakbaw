@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
 import express, { Response } from 'express';
 import multer from 'multer';
 import {
@@ -41,6 +43,8 @@ import {
 } from './supabase-sync';
 import { mirrorUsersAndSettingsToSupabase } from './supabase-restore';
 import { extractInvoiceFields } from './invoice-extract';
+import { buildCeoReport, buildReportWorkbook, parseReportRange } from './reports';
+import { listStoredBackups, resolveStoredBackup, restoreFromBackup, RestoreError, writeBackup } from './backup';
 import {
   AuditLogEntry,
   CheckRecord,
@@ -2235,8 +2239,15 @@ export function createApiRouter(): express.Router {
     // (CEO, sales manager, accounting) see the full log; everyone else sees only their own actions.
     const logUser = req.user!;
     const seesAllLogs = logUser.id === 'ceo' || logUser.id === 'sales_mgr' || logUser.id === 'accounting';
-    const whereClause = seesAllLogs ? '' : 'WHERE actor_id = ?';
-    const whereArgs: unknown[] = seesAllLogs ? [] : [logUser.id];
+    // Admin entries (backups, restores, report exports) are CEO-only.
+    const conditions: string[] = [];
+    const whereArgs: unknown[] = [];
+    if (logUser.id !== 'ceo') conditions.push(`category != 'admin'`);
+    if (!seesAllLogs) {
+      conditions.push('actor_id = ?');
+      whereArgs.push(logUser.id);
+    }
+    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
     const total = (
       db.prepare(`SELECT COUNT(*) as cnt FROM audit_logs ${whereClause}`).get(...whereArgs) as { cnt: number }
@@ -2369,6 +2380,110 @@ export function createApiRouter(): express.Router {
       roles: listPublicRoles(),
     });
   });
+
+  // ==================== CEO-only administration: reports, backups, restore ====================
+  // Everything under /admin goes through requireAuth + CEO check ONCE, here, before any handler.
+  // Backups contain every record and PIN hash; reports aggregate all reps' figures.
+  const admin = express.Router();
+  admin.use(requireAuth, requireRoles(['ceo'], 'این بخش فقط برای مدیرعامل در دسترس است.'));
+
+  admin.get('/reports/summary', (req: AuthedRequest, res) => {
+    const range = parseReportRange(req.query.from, req.query.to);
+    res.json({ report: buildCeoReport(range) });
+  });
+
+  admin.get('/reports/export.xlsx', async (req: AuthedRequest, res) => {
+    const range = parseReportRange(req.query.from, req.query.to);
+    const buffer = await buildReportWorkbook(range);
+    addAuditLog(req.user!.id, req.user!.displayName, 'admin', 'مدیرعامل خروجی اکسل گزارش‌ها را دریافت کرد.');
+    const stamp = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Tehran' }).format(new Date());
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="report-${stamp}.xlsx"`);
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(buffer);
+  });
+
+  admin.get('/backups', (_req: AuthedRequest, res) => {
+    res.json({ backups: listStoredBackups() });
+  });
+
+  // Fresh full backup, streamed directly to the CEO's browser.
+  admin.get('/backups/full', async (req: AuthedRequest, res) => {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="portal-backup-${stamp}.zip"`);
+    res.setHeader('Cache-Control', 'no-store');
+    try {
+      await writeBackup(res);
+      addAuditLog(req.user!.id, req.user!.displayName, 'admin', 'مدیرعامل نسخه پشتیبان کامل را دانلود کرد.');
+    } catch (err) {
+      console.error('[Backup] Download failed:', err instanceof Error ? err.message : err);
+      if (!res.headersSent) res.status(500).json({ error: 'ساخت نسخه پشتیبان با خطا مواجه شد.' });
+      else res.destroy();
+    }
+  });
+
+  admin.get('/backups/stored/:name', (req: AuthedRequest, res) => {
+    const filePath = resolveStoredBackup(String(req.params.name));
+    if (!filePath) {
+      res.status(404).json({ error: 'نسخه پشتیبان پیدا نشد.' });
+      return;
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.download(filePath, String(req.params.name));
+  });
+
+  // Restore: re-enter the CEO PIN, upload the ZIP. A safety backup of the current state is written first.
+  const restoreUpload = multer({
+    dest: os.tmpdir(),
+    limits: { fileSize: 4 * 1024 * 1024 * 1024, files: 1 },
+  });
+  admin.post('/backups/restore', restoreUpload.single('backup'), async (req: AuthedRequest, res) => {
+    const uploaded = req.file;
+    try {
+      const pin = normalizeDigits(String(req.body?.pin || ''));
+      const envCeoPin = process.env.CEO_INITIAL_PIN ? normalizeDigits(process.env.CEO_INITIAL_PIN) : '';
+      const ceoRow = db.prepare(`SELECT pin_hash, pin_salt FROM users WHERE id = 'ceo'`).get() as
+        | { pin_hash: string | null; pin_salt: string | null }
+        | undefined;
+      const pinOk =
+        pin.length >= 4 &&
+        ((envCeoPin.length >= 4 &&
+          pin.length === envCeoPin.length &&
+          crypto.timingSafeEqual(Buffer.from(pin), Buffer.from(envCeoPin))) ||
+          verifyPinHash(pin, ceoRow?.pin_hash ?? null, ceoRow?.pin_salt ?? null));
+      if (!pinOk) {
+        res.status(403).json({ error: 'رمز مدیرعامل اشتباه است؛ بازگردانی انجام نشد.' });
+        return;
+      }
+      if (!uploaded) {
+        res.status(400).json({ error: 'فایل پشتیبان انتخاب نشده است.' });
+        return;
+      }
+
+      const summary = await restoreFromBackup(uploaded.path, req.sessionTokenHash!);
+      addAuditLog(
+        req.user!.id,
+        req.user!.displayName,
+        'admin',
+        `مدیرعامل اطلاعات را از نسخه پشتیبان (${summary.backupCreatedAt}) بازگردانی کرد. نسخه ایمنی قبل از بازگردانی: ${summary.safetyBackup}`,
+      );
+      void mirrorUsersAndSettingsToSupabase();
+      for (const scope of ['orders', 'checks', 'procurement', 'settings', 'logs'] as const) broadcastChange(scope);
+      res.json({ summary });
+    } catch (err) {
+      if (err instanceof RestoreError) {
+        res.status(400).json({ error: err.message });
+      } else {
+        console.error('[Restore] Failed:', err instanceof Error ? err.message : err);
+        res.status(500).json({ error: 'بازگردانی با خطا مواجه شد؛ اطلاعات فعلی دست‌نخورده باقی ماند.' });
+      }
+    } finally {
+      if (uploaded) fs.rmSync(uploaded.path, { force: true });
+    }
+  });
+
+  router.use('/admin', admin);
 
   return router;
 }

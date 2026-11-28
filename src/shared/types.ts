@@ -152,7 +152,8 @@ export interface AuditLogEntry {
   id: number;
   actorId: string;
   actorName: string;
-  category: 'order' | 'finance' | 'procurement' | 'security' | 'settings';
+  /** 'admin' entries (backups, restores, report exports) are visible to the CEO only. */
+  category: 'order' | 'finance' | 'procurement' | 'security' | 'settings' | 'admin';
   message: string;
   createdAt: string;
 }
@@ -317,4 +318,55 @@ export interface InvoiceExtractionResponse {
   result: InvoiceExtractionResultDto;
   customerName?: string | null;
   duplicate?: DuplicateInvoiceInfo | null;
+}
+
+// ==================== CEO reports (CEO-only endpoints) ====================
+export interface CeoReportRepRow {
+  salesOwnerId: string;
+  salesOwnerName: string;
+  ordersCreated: number;
+  amountCreatedToman: number;
+  delivered: number;
+  amountDeliveredToman: number;
+  returned: number;
+  inProgress: number;
+}
+
+export interface CeoReport {
+  range: { from: string | null; to: string | null };
+  generatedAt: string;
+  orders: {
+    created: number;
+    amountCreatedToman: number;
+    delivered: number;
+    amountDeliveredToman: number;
+    returned: number;
+    inProgress: number;
+    avgDeliveryHours: number | null;
+    cartonDiscrepancies: number;
+    /** Current pipeline snapshot (all open orders, ignores the date range). */
+    pipelineByStage: Array<{ stage: number; label: string; count: number; amountToman: number }>;
+    returnReasons: Array<{ reason: string; count: number }>;
+  };
+  reps: CeoReportRepRow[];
+  checks: {
+    submitted: number;
+    amountSubmittedToman: number;
+    finalized: number;
+    amountFinalizedToman: number;
+    pending: number;
+    amountPendingToman: number;
+    returned: number;
+    byDocType: Array<{ docType: string; count: number; amountToman: number }>;
+    /** Pending/finalized received checks due in the next 30 days (ignores the date range). */
+    upcomingDue: Array<{ id: string; customer: string; amountToman: number; dueDate: string; sayadiId: string; salesOwnerName: string; status: string }>;
+  };
+  procurement: { open: number; urgentOpen: number };
+}
+
+export interface StoredBackupInfoDto {
+  name: string;
+  kind: 'auto' | 'safety';
+  sizeBytes: number;
+  createdAt: string;
 }

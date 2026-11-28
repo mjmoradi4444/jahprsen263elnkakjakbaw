@@ -1,5 +1,6 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useState } from 'react';
 import {
+  BarChart3,
   Factory,
   Landmark,
   LogOut,
@@ -17,13 +18,19 @@ import { Phase3Procurement } from './components/Phase3Procurement';
 import { SettingsModal } from './components/SettingsModal';
 import { UserAccountPublic } from './shared/types';
 
+// CEO-only module: loaded on demand, so other roles never even download this code.
+// (Access is enforced by the server; this only keeps it out of everyone else's UI.)
+const CeoAdmin = lazy(() => import('./components/CeoAdmin').then((m) => ({ default: m.CeoAdmin })));
+
+type PhaseId = 1 | 2 | 3 | 4;
+
 export default function App() {
   const [bootLoading, setBootLoading] = useState(true);
   const [initialized, setInitialized] = useState(false);
   const [roles, setRoles] = useState<UserAccountPublic[]>([]);
   const [user, setUser] = useState<UserAccountPublic | null>(null);
 
-  const [activePhase, setActivePhase] = useState<1 | 2 | 3>(1);
+  const [activePhase, setActivePhase] = useState<PhaseId>(1);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
@@ -107,9 +114,11 @@ export default function App() {
       ? 'فروش تا تحویل (فاز ۱)'
       : activePhase === 2
         ? 'مالی و صندوق چک‌ها (فاز ۲)'
-        : 'تامین ۵۰ برند (فاز ۳)';
+        : activePhase === 3
+          ? 'تامین ۵۰ برند (فاز ۳)'
+          : 'گزارش‌های مدیریتی و پشتیبان‌گیری';
 
-  const navItems: Array<{ id: 1 | 2 | 3; label: string; sub: string; icon: React.ReactNode; visible: boolean }> = [
+  const navItems: Array<{ id: PhaseId; label: string; sub: string; icon: React.ReactNode; visible: boolean }> = [
     {
       id: 1,
       label: 'فروش تا تحویل',
@@ -130,6 +139,13 @@ export default function App() {
       sub: 'کسری انبار و خرید',
       icon: <Factory className="w-4 h-4 shrink-0" />,
       visible: user.canAccessProcurement,
+    },
+    {
+      id: 4,
+      label: 'گزارش‌ها و پشتیبان',
+      sub: 'ویژه مدیرعامل',
+      icon: <BarChart3 className="w-4 h-4 shrink-0" />,
+      visible: user.id === 'ceo',
     },
   ];
 
@@ -328,6 +344,11 @@ export default function App() {
               onNotify={showToast}
               onDataChanged={() => setRefreshTrigger((n) => n + 1)}
             />
+          )}
+          {activePhase === 4 && user.id === 'ceo' && (
+            <Suspense fallback={<div className="text-sm text-slate-600">در حال بارگذاری...</div>}>
+              <CeoAdmin onNotify={showToast} refreshTrigger={refreshTrigger} />
+            </Suspense>
           )}
         </main>
       </div>

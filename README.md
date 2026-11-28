@@ -63,3 +63,19 @@ Duplicate proforma and final-invoice numbers are rejected with the original regi
 - Environment: `CEO_INITIAL_PIN`, `SESSION_SECRET`, `TRUST_PROXY=1` behind a proxy, and the `SUPABASE_*` variables. Never set `SEED_DEMO_DATA` in production.
 - SQLite is the live database; every write is mirrored to Supabase. If the server starts with an empty disk, data (orders, checks, procurement, files metadata, accounts, settings, customer codes) is restored from Supabase automatically. A persistent disk is still recommended.
 - `npm test` runs all unit tests.
+
+## CEO-only: reports and backups
+
+Everything under `/api/admin/*` is protected once at the router level (`requireAuth` + CEO role); every other role gets 403. `server/admin-access.test.ts` checks every role against every endpoint, plus path traversal and a full backup/restore round trip.
+
+- **Reports** (`/api/admin/reports/summary`, `/api/admin/reports/export.xlsx`): orders, deliveries, returns, per-rep performance, checks, upcoming due checks, open pipeline. Excel export is RTL with Jalali dates.
+- **Full backup** (`/api/admin/backups/full`): ZIP with a consistent SQLite snapshot and every uploaded file (local or Supabase).
+- **Daily automatic backup** in `DATA_DIR/backups`, newest 7 kept (`DISABLE_AUTO_BACKUP=1` turns it off).
+- **Restore** (`/api/admin/backups/restore`): requires the CEO PIN again, writes a safety backup first, accepts only whitelisted ZIP entries, restores all files to local disk, keeps the CEO signed in and signs everyone else out.
+- Admin audit-log entries (`category = 'admin'`) are visible to the CEO only.
+
+### Moving to another host
+
+1. CEO → «گزارش‌ها و پشتیبان» → download a full backup.
+2. Install the app on the new host and sign in as CEO (`CEO_INITIAL_PIN`).
+3. Upload the backup in the restore form. Everything (records, files, PINs, settings) comes back.

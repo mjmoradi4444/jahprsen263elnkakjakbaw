@@ -1,5 +1,7 @@
 import {
   AuditLogEntry,
+  CeoReport,
+  StoredBackupInfoDto,
   CheckRecord,
   DuplicateInvoiceInfo,
   InvoiceExtractionResponse,
@@ -470,3 +472,60 @@ export function subscribeLiveEvents(onEvent: (scope: string) => void): () => voi
     es.close();
   };
 }
+
+
+// ==================== CEO-only admin API (server rejects every other role with 403) ====================
+
+/** Downloads an authenticated binary response and hands it to the browser as a file. */
+async function downloadAuthenticated(url: string, fallbackName: string): Promise<void> {
+  const headers = new Headers();
+  if (inMemoryToken) headers.set('Authorization', `Bearer ${inMemoryToken}`);
+  const res = await fetch(url, { headers });
+  if (!res.ok) {
+    const data = (res.headers.get('content-type') || '').includes('application/json') ? await res.json() : null;
+    throw new ApiError(res.status, data?.error || `خطای سرور (کد ${res.status})`);
+  }
+  const disposition = res.headers.get('content-disposition') || '';
+  const match = disposition.match(/filename="([^"]+)"/);
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = objectUrl;
+  a.download = match?.[1] || fallbackName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
+}
+
+function rangeQuery(from: string | null, to: string | null): string {
+  const sp = new URLSearchParams();
+  if (from) sp.set('from', from);
+  if (to) sp.set('to', to);
+  const q = sp.toString();
+  return q ? `?${q}` : '';
+}
+
+export const adminApi = {
+  getReport: (from: string | null, to: string | null) =>
+    apiRequest<{ report: CeoReport }>(`/api/admin/reports/summary${rangeQuery(from, to)}`),
+
+  downloadReportXlsx: (from: string | null, to: string | null) =>
+    downloadAuthenticated(`/api/admin/reports/export.xlsx${rangeQuery(from, to)}`, 'report.xlsx'),
+
+  downloadFullBackup: () => downloadAuthenticated('/api/admin/backups/full', 'portal-backup.zip'),
+
+  listBackups: () => apiRequest<{ backups: StoredBackupInfoDto[] }>('/api/admin/backups'),
+
+  downloadStoredBackup: (name: string) =>
+    downloadAuthenticated(`/api/admin/backups/stored/${encodeURIComponent(name)}`, name),
+
+  restoreBackup: (file: File, pin: string) => {
+    const fd = new FormData();
+    fd.append('pin', pin);
+    fd.append('backup', file);
+    return apiRequest<{
+      summary: { backupCreatedAt: string; counts: Record<string, number>; filesRestored: number; safetyBackup: string };
+    }>('/api/admin/backups/restore', { method: 'POST', body: fd });
+  },
+};
