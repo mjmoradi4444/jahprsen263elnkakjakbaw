@@ -45,6 +45,8 @@ const RESTORE_TABLES = [
   'procurement_items',
   'audit_logs',
   'customer_codes',
+  'invoice_extractions',
+  'order_revisions',
 ] as const;
 
 export interface BackupManifest {

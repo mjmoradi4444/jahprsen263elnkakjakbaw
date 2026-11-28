@@ -42,6 +42,8 @@ interface Phase1OrdersProps {
 
 export function Phase1Orders({ user, roles, refreshTrigger, onNotify, onDataChanged }: Phase1OrdersProps) {
   const [subTab, setSubTab] = useState<'board' | 'new' | 'logs'>('board');
+  // Events log & WhatsApp summary: CEO, accounting and warehouse supervisor only (enforced server-side too).
+  const canSeeLogs = user.id === 'ceo' || user.id === 'accounting' || user.id === 'warehouse_sup';
   const [filter, setFilter] = useState<string>(user.id === 'ceo' ? 'active' : 'mine');
   const [selectedStage, setSelectedStage] = useState<number | null>(null);
   const [search, setSearch] = useState('');
@@ -159,7 +161,7 @@ export function Phase1Orders({ user, roles, refreshTrigger, onNotify, onDataChan
   );
 
   useEffect(() => {
-    if (subTab !== 'logs') return;
+    if (subTab !== 'logs' || !canSeeLogs) return;
     api
       .getLogs(logsPage, 25)
       .then(setLogsData)
@@ -168,7 +170,7 @@ export function Phase1Orders({ user, roles, refreshTrigger, onNotify, onDataChan
       .getWhatsAppSummary()
       .then(setWaSummary)
       .catch(() => {});
-  }, [subTab, logsPage, refreshTrigger]);
+  }, [subTab, logsPage, refreshTrigger, canSeeLogs]);
 
   async function handleAdvance(order: OrderRecord) {
     setBusyOrderId(order.id);
@@ -402,17 +404,19 @@ export function Phase1Orders({ user, roles, refreshTrigger, onNotify, onDataChan
               ثبت پیش‌فاکتور جدید
             </button>
           )}
-          <button
-            type="button"
-            role="tab"
-            aria-selected={subTab === 'logs'}
-            onClick={() => setSubTab('logs')}
-            className={`px-3.5 py-2 rounded-md text-xs font-bold transition-colors whitespace-nowrap cursor-pointer ${
-              subTab === 'logs' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            گزارش وقایع و واتساپ
-          </button>
+          {canSeeLogs && (
+            <button
+              type="button"
+              role="tab"
+              aria-selected={subTab === 'logs'}
+              onClick={() => setSubTab('logs')}
+              className={`px-3.5 py-2 rounded-md text-xs font-bold transition-colors whitespace-nowrap cursor-pointer ${
+                subTab === 'logs' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              گزارش وقایع و واتساپ
+            </button>
+          )}
         </div>
 
         {subTab === 'board' && (
@@ -914,7 +918,7 @@ export function Phase1Orders({ user, roles, refreshTrigger, onNotify, onDataChan
       {subTab === 'new' && user.isSales && <NewOrderForm onCreated={handleOrderCreated} />}
 
       {/* TAB 3: AUDIT LOGS & BOUNDED WHATSAPP REPORT */}
-      {subTab === 'logs' && (
+      {subTab === 'logs' && canSeeLogs && (
         <div className="space-y-4">
           <section className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-3">

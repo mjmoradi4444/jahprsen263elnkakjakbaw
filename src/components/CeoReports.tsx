@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { AlertTriangle, BarChart3, CheckCircle2, Clock, FileSpreadsheet, Hourglass, Loader2, PackageCheck, Undo2 } from 'lucide-react';
 import { adminApi, ApiError } from '../api/client';
 import { CeoReport } from '../shared/types';
+import { diffCount, RevisionDiffList } from './RevisionDiff';
 import { CHART, ChartCard, compactToman, DataTable, fullToman, HBarChart, Legend, LineChart, SegmentedBar } from './charts';
 
 /**
@@ -472,6 +473,57 @@ export function CeoReports({ onNotify, refreshTrigger }: CeoReportsProps) {
               )}
             </section>
           </div>
+
+          {/* Proforma revisions: item / quantity / price / amount differences */}
+          <section className="bg-white border border-slate-200 rounded-xl p-4 min-w-0">
+            <div className="flex flex-wrap items-baseline justify-between gap-2 mb-3">
+              <h2 className="text-sm font-extrabold text-slate-900">مغایرت‌های اصلاح پیش‌فاکتور</h2>
+              <p className="text-[11px] text-slate-500">
+                {fa.format(report.revisions.count)} اصلاحیه در {fa.format(report.revisions.ordersAffected)} سفارش ·{' '}
+                {fa.format(report.revisions.withItemChanges)} مورد با تغییر اقلام · تغییر خالص مبلغ:{' '}
+                <span dir="ltr" className="tabular-nums">
+                  {report.revisions.amountDeltaToman > 0 ? '+' : ''}
+                  {fullToman(report.revisions.amountDeltaToman)}
+                </span>
+              </p>
+            </div>
+            {report.revisions.items.length === 0 ? (
+              <p className="text-xs text-slate-500">در این بازه پیش‌فاکتوری اصلاح نشده است.</p>
+            ) : (
+              <div className="overflow-x-auto">
+                <DataTable
+                  columns={[
+                    { key: 'date', label: 'تاریخ' },
+                    { key: 'rep', label: 'کارشناس' },
+                    { key: 'customer', label: 'مشتری' },
+                    { key: 'proforma', label: 'پیش‌فاکتور' },
+                    { key: 'reason', label: 'علت برگشت' },
+                    { key: 'changes', label: 'مغایرت‌ها' },
+                  ]}
+                  rows={report.revisions.items.map((r) => ({
+                    date: faDate.format(new Date(r.createdAt)),
+                    rep: r.salesOwnerName,
+                    customer: r.customer,
+                    proforma: (
+                      <span className="font-mono-code whitespace-nowrap" dir="ltr">
+                        {r.oldProforma === r.newProforma ? r.newProforma : `${r.oldProforma} → ${r.newProforma}`}
+                        <span className="text-slate-400"> #{r.rev}</span>
+                      </span>
+                    ),
+                    reason: r.returnReason,
+                    changes: (
+                      <div className="min-w-[240px]">
+                        <RevisionDiffList diff={r.items} oldAmountToman={r.oldAmountToman} newAmountToman={r.newAmountToman} />
+                        {diffCount(r.items) > 0 && r.comparisonSource !== 'pdf' && (
+                          <p className="text-[10px] text-slate-400 mt-0.5">مقایسه از روی متن اقلام</p>
+                        )}
+                      </div>
+                    ),
+                  }))}
+                />
+              </div>
+            )}
+          </section>
 
           <p className="text-[11px] text-slate-500">
             اقلام کسری باز در واحد تامین: {fa.format(report.procurement.open)}

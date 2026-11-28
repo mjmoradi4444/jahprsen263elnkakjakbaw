@@ -1,6 +1,6 @@
 import ExcelJS from 'exceljs';
 import { db, hydrateCheckRow, hydrateOrderRow, hydrateProcurementRow } from './db';
-import { CeoReport, CeoReportRepRow, CheckRecord, OrderRecord, STAGES } from '../src/shared/types';
+import { CeoReport, CeoReportRepRow, CeoRevisionRow, CheckRecord, OrderRecord, RevisionItemsDiff, STAGES } from '../src/shared/types';
 
 /**
  * CEO reports. Every function here reads ALL records with no role filtering, so the routes that
@@ -156,6 +156,41 @@ function groupOrders(orders: OrderRecord[], pick: (o: OrderRecord) => string) {
   return [...m.values()].sort((a, b) => b.amountToman - a.amountToman);
 }
 
+function loadRevisions(range: ReportRange): CeoRevisionRow[] {
+  const rows = db.prepare(`SELECT * FROM order_revisions ORDER BY created_at DESC`).all() as Array<Record<string, unknown>>;
+  const empty: RevisionItemsDiff = { added: [], removed: [], qtyChanged: [], priceChanged: [], unchanged: 0 };
+  return rows
+    .filter((r) => inRange(String(r.created_at), range))
+    .map((r) => {
+      let items = empty;
+      try {
+        items = { ...empty, ...(JSON.parse(String(r.changes_json || '{}')).items || {}) };
+      } catch {
+        // keep empty diff
+      }
+      return {
+        id: String(r.id),
+        orderId: String(r.order_id),
+        rev: Number(r.rev),
+        customer: String(r.customer),
+        salesOwnerName: String(r.sales_owner_name),
+        returnReason: String(r.return_reason || ''),
+        returnNote: String(r.return_note || ''),
+        oldProforma: String(r.old_proforma),
+        newProforma: String(r.new_proforma),
+        oldAmountToman: r.old_amount_toman === null ? null : Number(r.old_amount_toman),
+        newAmountToman: r.new_amount_toman === null ? null : Number(r.new_amount_toman),
+        items,
+        comparisonSource: r.comparison_source === 'pdf' ? 'pdf' : 'text',
+        createdAt: String(r.created_at),
+      } as CeoRevisionRow;
+    });
+}
+
+function hasItemChanges(d: RevisionItemsDiff): boolean {
+  return d.added.length + d.removed.length + d.qtyChanged.length + d.priceChanged.length > 0;
+}
+
 export function buildCeoReport(range: ReportRange, now = new Date()): CeoReport {
   const { orders, checks } = loadAll();
 
@@ -288,6 +323,16 @@ export function buildCeoReport(range: ReportRange, now = new Date()): CeoReport 
         m.set(key, c);
       }
       return [...m.values()].sort((a, b) => b.amountToman - a.amountToman).slice(0, 10);
+    })(),
+    revisions: (() => {
+      const revs = loadRevisions(range);
+      return {
+        count: revs.length,
+        ordersAffected: new Set(revs.map((r) => r.orderId)).size,
+        withItemChanges: revs.filter((r) => hasItemChanges(r.items)).length,
+        amountDeltaToman: revs.reduce((a, r) => a + ((r.newAmountToman ?? 0) - (r.oldAmountToman ?? 0)), 0),
+        items: revs.slice(0, 200),
+      };
     })(),
   };
 }
@@ -477,6 +522,59 @@ export async function buildReportWorkbook(range: ReportRange): Promise<Buffer> {
     });
   }
   styleSheet(cs);
+
+  // Proforma revisions: one row per changed item (plus one row for amount-only revisions)
+  const rv = wb.addWorksheet('مغایرت اصلاحیه‌ها');
+  rv.columns = [
+    { header: 'تاریخ اصلاح', key: 'date', width: 18 },
+    { header: 'کارشناس', key: 'rep', width: 18 },
+    { header: 'مشتری', key: 'customer', width: 24 },
+    { header: 'پیش‌فاکتور قبلی', key: 'oldP', width: 14 },
+    { header: 'پیش‌فاکتور جدید', key: 'newP', width: 14 },
+    { header: 'شماره اصلاحیه', key: 'rev', width: 12 },
+    { header: 'علت برگشت', key: 'reason', width: 26 },
+    { header: 'نوع تغییر', key: 'kind', width: 16 },
+    { header: 'کد کالا', key: 'code', width: 14 },
+    { header: 'شرح کالا', key: 'desc', width: 34 },
+    { header: 'مقدار قبلی', key: 'oldQ', width: 11 },
+    { header: 'مقدار جدید', key: 'newQ', width: 11 },
+    { header: 'مبلغ واحد قبلی (ریال)', key: 'oldU', width: 18, style: { numFmt: money } },
+    { header: 'مبلغ واحد جدید (ریال)', key: 'newU', width: 18, style: { numFmt: money } },
+    { header: 'مبلغ کل قبلی (تومان)', key: 'oldA', width: 18, style: { numFmt: money } },
+    { header: 'مبلغ کل جدید (تومان)', key: 'newA', width: 18, style: { numFmt: money } },
+    { header: 'مبنای مقایسه', key: 'src', width: 16 },
+  ];
+  for (const r of report.revisions.items) {
+    const base = {
+      date: jalaliDateTime(r.createdAt),
+      rep: safeText(r.salesOwnerName),
+      customer: safeText(r.customer),
+      oldP: safeText(r.oldProforma),
+      newP: safeText(r.newProforma),
+      rev: r.rev,
+      reason: safeText([r.returnReason, r.returnNote].filter(Boolean).join(' - ')),
+      oldA: r.oldAmountToman,
+      newA: r.newAmountToman,
+      src: r.comparisonSource === 'pdf' ? 'خوانده‌شده از PDF' : 'متن اقلام',
+    };
+    const rows: Array<Record<string, unknown>> = [
+      ...r.items.added.map((i) => ({ kind: 'قلم جدید', code: i.code, desc: i.description, newQ: i.qty })),
+      ...r.items.removed.map((i) => ({ kind: 'قلم حذف‌شده', code: i.code, desc: i.description, oldQ: i.qty })),
+      ...r.items.qtyChanged.map((i) => ({ kind: 'تغییر مقدار', code: i.code, desc: i.description, oldQ: i.oldQty, newQ: i.newQty })),
+      ...r.items.priceChanged.map((i) => ({
+        kind: 'تغییر قیمت',
+        code: i.code,
+        desc: i.description,
+        oldU: i.oldUnitPriceRial,
+        newU: i.newUnitPriceRial,
+      })),
+    ];
+    if (rows.length === 0) rows.push({ kind: r.oldAmountToman !== r.newAmountToman ? 'فقط تغییر مبلغ' : 'بدون تغییر اقلام' });
+    for (const row of rows) {
+      rv.addRow({ ...base, ...row, code: safeText(row.code), desc: safeText(row.desc) });
+    }
+  }
+  styleSheet(rv);
 
   const arrayBuffer = await wb.xlsx.writeBuffer();
   return Buffer.from(arrayBuffer as ArrayBuffer);

@@ -318,6 +318,13 @@ export interface InvoiceExtractionResponse {
   result: InvoiceExtractionResultDto;
   customerName?: string | null;
   duplicate?: DuplicateInvoiceInfo | null;
+  /** Only when extracting a revised proforma for a returned order: differences with the previous one. */
+  comparison?: {
+    changes: { items: RevisionItemsDiff; hasItemChanges: boolean };
+    oldAmountToman: number | null;
+    newAmountToman: number | null;
+    oldProforma: string;
+  } | null;
 }
 
 // ==================== CEO reports (CEO-only endpoints) ====================
@@ -377,6 +384,45 @@ export interface CeoReport {
   byChannel: Array<{ label: string; count: number; amountToman: number }>;
   byPayment: Array<{ label: string; count: number; amountToman: number }>;
   topCustomers: Array<{ customer: string; orders: number; amountToman: number; delivered: number }>;
+  /** Proforma revisions in the range, with item / quantity / price / amount differences. */
+  revisions: {
+    count: number;
+    ordersAffected: number;
+    withItemChanges: number;
+    amountDeltaToman: number;
+    items: CeoRevisionRow[];
+  };
+}
+
+export interface RevisionItemRef {
+  code: string;
+  description: string;
+  unit: string;
+}
+
+export interface RevisionItemsDiff {
+  added: Array<RevisionItemRef & { qty: number | null }>;
+  removed: Array<RevisionItemRef & { qty: number | null }>;
+  qtyChanged: Array<RevisionItemRef & { oldQty: number | null; newQty: number | null }>;
+  priceChanged: Array<RevisionItemRef & { oldUnitPriceRial: number; newUnitPriceRial: number }>;
+  unchanged: number;
+}
+
+export interface CeoRevisionRow {
+  id: string;
+  orderId: string;
+  rev: number;
+  customer: string;
+  salesOwnerName: string;
+  returnReason: string;
+  returnNote: string;
+  oldProforma: string;
+  newProforma: string;
+  oldAmountToman: number | null;
+  newAmountToman: number | null;
+  items: RevisionItemsDiff;
+  comparisonSource: 'pdf' | 'text';
+  createdAt: string;
 }
 
 export interface StoredBackupInfoDto {

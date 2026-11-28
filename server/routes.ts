@@ -40,9 +40,13 @@ import {
   syncOrderToSupabase,
   syncProcurementToSupabase,
   logMirrorError,
+  deleteDocumentMirrors,
+  syncRevisionToSupabase,
 } from './supabase-sync';
 import { mirrorUsersAndSettingsToSupabase } from './supabase-restore';
 import { extractInvoiceFields } from './invoice-extract';
+import { deleteStoredFile } from './storage';
+import { buildRevisionChanges, ComparableItem, parseItemsText, parseStoredItems } from './proforma-diff';
 import { buildCeoReport, buildReportWorkbook, parseReportRange } from './reports';
 import { listStoredBackups, resolveStoredBackup, restoreFromBackup, RestoreError, writeBackup } from './backup';
 import {
@@ -221,6 +225,33 @@ export function findDuplicateFinalInvoice(finalInvoiceNo: string, excludeOrderId
     registeredAt: issuedAt,
     message: `این شماره فاکتور نهایی («${row.final_invoice_no}») قبلاً توسط «${issuedBy}» در تاریخ ${date} ساعت ${time} برای پیش‌فاکتور «${row.proforma}» (مشتری «${row.customer}») ثبت شده است.`,
   };
+}
+
+// ==================== Proforma items (for revision comparisons) ====================
+
+/** Items of an order's current proforma: from its read PDF when available, else parsed from text. */
+export /** Roles allowed to see the events log and the WhatsApp summary. */
+const LOG_VIEWER_ROLES: RoleId[] = ['ceo', 'accounting', 'warehouse_sup'];
+const LOG_FORBIDDEN_MESSAGE = 'گزارش وقایع و خلاصه واتساپ فقط برای مدیرعامل، واحد مالی و سرپرست انبار در دسترس است.';
+
+/** Hides money amounts in a log message (for the warehouse supervisor). */
+export function maskAmounts(message: string): string {
+  return message.replace(/[0-9۰-۹٬,.]+\s*(?:میلیون\s*)?(تومان|ریال)/g, '*** $1');
+}
+
+function currentOrderItems(orderId: string, itemsText: string): ComparableItem[] {
+  const row = db.prepare(`SELECT items_json FROM orders WHERE id = ?`).get(orderId) as { items_json: string } | undefined;
+  return parseStoredItems(row?.items_json) ?? parseItemsText(itemsText);
+}
+
+/** Items the server read from an uploaded PDF, if it was read. */
+export function extractedItemsForFile(fileId: string | null): ComparableItem[] | null {
+  if (!fileId) return null;
+  const row = db.prepare(`SELECT items_json FROM invoice_extractions WHERE file_id = ?`).get(fileId) as
+    | { items_json: string }
+    | undefined;
+  const items = parseStoredItems(row?.items_json);
+  return items && items.length > 0 ? items : null;
 }
 
 export function createApiRouter(): express.Router {
@@ -907,6 +938,30 @@ export function createApiRouter(): express.Router {
 
     const result = await extractInvoiceFields(Buffer.concat(chunks), fileRow.original_name);
 
+    // Remember exactly what the PDF says: used later as the authoritative item list for this
+    // proforma (the rep can still edit the form fields, but comparisons use the PDF content).
+    if (result.ok) {
+      db.prepare(`
+        INSERT INTO invoice_extractions (file_id, invoice_number, grand_total_rial, items_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(file_id) DO UPDATE SET invoice_number = excluded.invoice_number,
+          grand_total_rial = excluded.grand_total_rial, items_json = excluded.items_json
+      `).run(fileRow.id, result.invoiceNumber, result.grandTotalRial, JSON.stringify(result.items), new Date().toISOString());
+    }
+
+    // When revising a returned order, compare with the order's current proforma.
+    const reviseOrderId = req.body?.orderId ? String(req.body.orderId) : null;
+    let revisionOrder: OrderRecord | null = null;
+    if (reviseOrderId) {
+      const row = db.prepare(`SELECT * FROM orders WHERE id = ?`).get(reviseOrderId) as Record<string, unknown> | undefined;
+      const o = row ? hydrateOrderRow(row) : null;
+      if (o && o.salesOwnerId === user.id && o.status === 'returned_to_sales') revisionOrder = o;
+    }
+    let comparison: ReturnType<typeof buildRevisionChanges> | null = null;
+    if (revisionOrder && result.ok) {
+      comparison = buildRevisionChanges(currentOrderItems(revisionOrder.id, revisionOrder.items), result.items);
+    }
+
     // Customer name: look up the buyer code learned from earlier orders.
     let customerName: string | null = null;
     if (result.buyerCode) {
@@ -917,9 +972,21 @@ export function createApiRouter(): express.Router {
     }
 
     // Duplicate check right away, so the rep sees it before filling anything else.
-    const duplicate = result.invoiceNumber ? findDuplicateProforma(result.invoiceNumber) : null;
+    const duplicate = result.invoiceNumber ? findDuplicateProforma(result.invoiceNumber, revisionOrder?.id ?? null) : null;
 
-    res.json({ result, customerName, duplicate });
+    res.json({
+      result,
+      customerName,
+      duplicate,
+      comparison: comparison
+        ? {
+            changes: comparison,
+            oldAmountToman: revisionOrder!.amountToman,
+            newAmountToman: result.amountToman,
+            oldProforma: revisionOrder!.proforma,
+          }
+        : null,
+    });
   });
 
   // Instant duplicate check while the rep is filling the form (before submit).
@@ -1020,6 +1087,11 @@ export function createApiRouter(): express.Router {
     });
 
     tx();
+
+    const pdfItems = extractedItemsForFile(fileId);
+    if (pdfItems) {
+      db.prepare(`UPDATE orders SET items_json = ? WHERE id = ?`).run(JSON.stringify(pdfItems), orderId);
+    }
 
     if (customerCode) {
       db.prepare(`
@@ -1636,7 +1708,7 @@ export function createApiRouter(): express.Router {
   });
 
   // Revise returned order (Sales owner only — preserves full stage history & proforma document history!)
-  router.post('/orders/:id/revise', requireAuth, (req: AuthedRequest, res) => {
+  router.post('/orders/:id/revise', requireAuth, async (req: AuthedRequest, res) => {
     const user = req.user!;
     const expectedVersion = Number(req.body?.expectedVersion);
     const check = getOrderWithVersionCheck(String(req.params.id), expectedVersion);
@@ -1671,8 +1743,68 @@ export function createApiRouter(): express.Router {
       }
     }
 
+    // A new proforma file must be the rep's own, still-unattached upload.
+    let newFileRow: { id: string; storage_url: string; original_name: string; mime_type: string } | null = null;
+    if (fileId) {
+      const fRow = db
+        .prepare(`SELECT id, storage_url, original_name, mime_type, uploaded_by, owner_record_id FROM files WHERE id = ?`)
+        .get(fileId) as
+        | { id: string; storage_url: string; original_name: string; mime_type: string; uploaded_by: string; owner_record_id: string | null }
+        | undefined;
+      if (!fRow || fRow.uploaded_by !== user.id || fRow.owner_record_id) {
+        res.status(400).json({ error: 'فایل پیش‌فاکتور اصلاحی معتبر نیست؛ دوباره بارگذاری کنید.' });
+        return;
+      }
+      newFileRow = fRow;
+    }
+
+    // Compare the previous proforma's items with the new one. The PDF content wins over typed text.
+    const oldItems = currentOrderItems(order.id, order.items);
+    const newPdfItems = extractedItemsForFile(newFileRow?.id ?? null);
+    const newItemsForDiff = newPdfItems ?? parseItemsText(newItems);
+    const changes = buildRevisionChanges(oldItems, newItemsForDiff);
+    const oldItemsJsonRow = db.prepare(`SELECT items_json FROM orders WHERE id = ?`).get(order.id) as { items_json: string };
+    const comparisonSource = newPdfItems && parseStoredItems(oldItemsJsonRow.items_json) ? 'pdf' : 'text';
+
+    // Previous proforma documents are removed when a new proforma file replaces them.
+    const supersededDocs = newFileRow
+      ? (db
+          .prepare(
+            `SELECT d.id AS doc_id, d.original_name, f.id AS file_id, f.storage_provider, f.storage_bucket, f.storage_path, f.stored_filename
+             FROM order_documents d LEFT JOIN files f ON f.id = d.file_id
+             WHERE d.order_id = ? AND d.doc_kind = 'proforma'`,
+          )
+          .all(order.id) as Array<{
+          doc_id: string;
+          original_name: string;
+          file_id: string | null;
+          storage_provider: string;
+          storage_bucket: string;
+          storage_path: string;
+          stored_filename: string;
+        }>)
+      : [];
+
     const now = new Date().toISOString();
     const nextRev = order.rev + 1;
+    const revisionRow = {
+      id: `rev-${crypto.randomUUID().slice(0, 12)}`,
+      order_id: order.id,
+      rev: nextRev,
+      sales_owner_id: order.salesOwnerId,
+      sales_owner_name: order.salesOwnerName,
+      customer: order.customer,
+      return_reason: order.returnReason || '',
+      return_note: order.returnNote || '',
+      old_proforma: order.proforma,
+      new_proforma: newProforma,
+      old_amount_toman: order.amountToman,
+      new_amount_toman: newAmount,
+      changes_json: JSON.stringify(changes),
+      comparison_source: comparisonSource,
+      deleted_file_names: supersededDocs.map((d) => d.original_name).join('، '),
+      created_at: now,
+    };
     // Append to history instead of wiping previous stageHistory!
     const nextHistory: StageHistoryEntry[] = [
       ...order.stageHistory,
@@ -1700,25 +1832,49 @@ export function createApiRouter(): express.Router {
         );
       if (updated.changes === 0) throw new Error('VERSION_CONFLICT');
 
-      if (fileId) {
-        const fRow = db
-          .prepare(`SELECT id, storage_url, original_name, mime_type, uploaded_by FROM files WHERE id = ?`)
-          .get(fileId) as { id: string; storage_url: string; original_name: string; mime_type: string; uploaded_by: string } | undefined;
-        if (fRow && fRow.uploaded_by === user.id) {
+      db.prepare(`
+        INSERT INTO order_revisions (id, order_id, rev, sales_owner_id, sales_owner_name, customer, return_reason,
+          return_note, old_proforma, new_proforma, old_amount_toman, new_amount_toman, changes_json,
+          comparison_source, deleted_file_names, created_at)
+        VALUES (@id, @order_id, @rev, @sales_owner_id, @sales_owner_name, @customer, @return_reason, @return_note,
+          @old_proforma, @new_proforma, @old_amount_toman, @new_amount_toman, @changes_json, @comparison_source,
+          @deleted_file_names, @created_at)
+      `).run(revisionRow);
+
+      // The new proforma's items become the baseline for the next comparison.
+      db.prepare(`UPDATE orders SET items_json = ? WHERE id = ?`).run(
+        newPdfItems ? JSON.stringify(newPdfItems) : '',
+        order.id,
+      );
+
+      // Drop the superseded proforma documents (their binaries are deleted after commit).
+      for (const d of supersededDocs) {
+        db.prepare(`DELETE FROM order_documents WHERE id = ?`).run(d.doc_id);
+        if (d.file_id) {
+          db.prepare(`DELETE FROM invoice_extractions WHERE file_id = ?`).run(d.file_id);
+          db.prepare(`DELETE FROM files WHERE id = ?`).run(d.file_id);
+        }
+      }
+
+      if (newFileRow) {
+        const fRow = newFileRow;
+        {
           const maxVer = (
             db
               .prepare(`SELECT COALESCE(MAX(version_no), 0) as mv FROM order_documents WHERE order_id = ? AND doc_kind = 'proforma'`)
               .get(order.id) as { mv: number }
           ).mv;
+          // Version number continues from the revision count so it stays meaningful after deletions.
+          const versionNo = Math.max(maxVer + 1, nextRev + 1);
           const resolvedUrl = fRow.storage_url || `/api/files/${encodeURIComponent(fRow.id)}`;
-          db.prepare(`UPDATE files SET owner_kind = 'order_doc', owner_record_id = ? WHERE id = ?`).run(order.id, fileId);
+          db.prepare(`UPDATE files SET owner_kind = 'order_doc', owner_record_id = ? WHERE id = ?`).run(order.id, fRow.id);
           db.prepare(`
             INSERT INTO order_documents (id, order_id, doc_kind, version_no, file_id, file_url, original_name, mime_type, uploaded_by, created_at)
             VALUES (?, ?, 'proforma', ?, ?, ?, ?, ?, ?, ?)
           `).run(
             `doc-${crypto.randomUUID().slice(0, 8)}`,
             order.id,
-            maxVer + 1,
+            versionNo,
             fRow.id,
             resolvedUrl,
             fRow.original_name,
@@ -1747,10 +1903,29 @@ export function createApiRouter(): express.Router {
       throw e;
     }
 
+    // Remove the superseded binaries (local disk or Supabase Storage) and their mirror rows.
+    for (const d of supersededDocs) {
+      if (d.file_id) {
+        await deleteStoredFile({
+          storageProvider: d.storage_provider,
+          storageBucket: d.storage_bucket,
+          storagePath: d.storage_path,
+          storedFilename: d.stored_filename,
+        });
+      }
+    }
+    if (supersededDocs.length) {
+      await deleteDocumentMirrors(
+        supersededDocs.map((d) => d.doc_id),
+        supersededDocs.map((d) => d.file_id).filter((x): x is string => Boolean(x)),
+      );
+    }
+
     const fresh = hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order.id) as Record<string, unknown>);
-    syncOrderToSupabase(req.supabase, fresh).catch(logMirrorError('order', fresh.id));
+    await syncOrderToSupabase(req.supabase, fresh).catch(logMirrorError('order', fresh.id));
+    await syncRevisionToSupabase(req.supabase, revisionRow).catch(logMirrorError('revision', revisionRow.id));
     broadcastChange('orders');
-    res.json({ order: fresh });
+    res.json({ order: fresh, revision: { id: revisionRow.id, changes, comparisonSource } });
   });
 
   // ==================== Finance & Checks Endpoints (Phase 2 — Protected by RBAC Middleware) ====================
@@ -2230,23 +2405,19 @@ export function createApiRouter(): express.Router {
   });
 
   // ==================== Audit Logs & Bounded WhatsApp Summary ====================
-  router.get('/logs', requireAuth, (req: AuthedRequest, res) => {
+  router.get('/logs', requireAuth, requireRoles(LOG_VIEWER_ROLES, LOG_FORBIDDEN_MESSAGE), (req: AuthedRequest, res) => {
     const page = Math.max(1, Number(req.query.page || 1));
     const limit = Math.min(100, Math.max(10, Number(req.query.limit || 30)));
     const offset = (page - 1) * limit;
 
-    // Audit messages contain customer names and amounts across all reps. Only supervisory roles
-    // (CEO, sales manager, accounting) see the full log; everyone else sees only their own actions.
+    // The events log is visible only to the CEO, accounting and the warehouse supervisor.
+    // CEO: everything. Accounting: everything except CEO admin actions (backups, restores, exports).
+    // Warehouse supervisor: order and procurement events only, with amounts masked.
     const logUser = req.user!;
-    const seesAllLogs = logUser.id === 'ceo' || logUser.id === 'sales_mgr' || logUser.id === 'accounting';
-    // Admin entries (backups, restores, report exports) are CEO-only.
     const conditions: string[] = [];
     const whereArgs: unknown[] = [];
-    if (logUser.id !== 'ceo') conditions.push(`category != 'admin'`);
-    if (!seesAllLogs) {
-      conditions.push('actor_id = ?');
-      whereArgs.push(logUser.id);
-    }
+    if (logUser.id === 'accounting') conditions.push(`category != 'admin'`);
+    if (logUser.id === 'warehouse_sup') conditions.push(`category IN ('order', 'procurement')`);
     const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
     const total = (
@@ -2272,7 +2443,7 @@ export function createApiRouter(): express.Router {
           actorId: r.actor_id,
           actorName: r.actor_name,
           category: r.category,
-          message: r.message,
+          message: logUser.id === 'warehouse_sup' ? maskAmounts(r.message) : r.message,
           createdAt: r.created_at,
         }),
       ),
@@ -2280,7 +2451,7 @@ export function createApiRouter(): express.Router {
     });
   });
 
-  router.get('/whatsapp-summary', requireAuth, (req: AuthedRequest, res) => {
+  router.get('/whatsapp-summary', requireAuth, requireRoles(LOG_VIEWER_ROLES, LOG_FORBIDDEN_MESSAGE), (req: AuthedRequest, res) => {
     const user = req.user!;
     const allOrders = (db.prepare(`SELECT * FROM orders ORDER BY updated_at DESC`).all() as Array<Record<string, unknown>>)
       .map(hydrateOrderRow)

@@ -187,6 +187,38 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(id DESC);
 
+  -- What the server read from an uploaded invoice PDF (authoritative, not editable by the rep).
+  CREATE TABLE IF NOT EXISTS invoice_extractions (
+    file_id TEXT PRIMARY KEY,
+    invoice_number TEXT,
+    grand_total_rial INTEGER,
+    items_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+  );
+
+  -- One row per proforma revision: what changed between the previous and the new proforma.
+  -- Kept permanently for reports, even though the previous proforma file itself is deleted.
+  CREATE TABLE IF NOT EXISTS order_revisions (
+    id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    rev INTEGER NOT NULL,
+    sales_owner_id TEXT NOT NULL,
+    sales_owner_name TEXT NOT NULL,
+    customer TEXT NOT NULL,
+    return_reason TEXT NOT NULL DEFAULT '',
+    return_note TEXT NOT NULL DEFAULT '',
+    old_proforma TEXT NOT NULL,
+    new_proforma TEXT NOT NULL,
+    old_amount_toman INTEGER,
+    new_amount_toman INTEGER,
+    changes_json TEXT NOT NULL DEFAULT '{}',
+    comparison_source TEXT NOT NULL DEFAULT 'text',
+    deleted_file_names TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_order_revisions_created ON order_revisions(created_at);
+  CREATE INDEX IF NOT EXISTS idx_order_revisions_order ON order_revisions(order_id);
+
   -- Customer code (as printed on invoices) -> customer name, learned from submitted orders.
   CREATE TABLE IF NOT EXISTS customer_codes (
     code TEXT PRIMARY KEY,
@@ -212,6 +244,8 @@ db.exec(`
   ensureCol('orders', 'signature_url', `signature_url TEXT NOT NULL DEFAULT ''`);
   ensureCol('order_documents', 'file_url', `file_url TEXT NOT NULL DEFAULT ''`);
   ensureCol('check_attachments', 'file_url', `file_url TEXT NOT NULL DEFAULT ''`);
+  // Structured items of the current proforma (from the PDF when it was read), used for revision diffs.
+  ensureCol('orders', 'items_json', `items_json TEXT NOT NULL DEFAULT ''`);
 })();
 
 // ==================== Password / PIN Hashing (scrypt + timingSafeEqual) ====================

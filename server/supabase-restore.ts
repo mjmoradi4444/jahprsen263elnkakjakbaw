@@ -111,7 +111,7 @@ export async function restoreFromSupabaseIfEmpty(clientOverride?: SupabaseClient
   if (localCount > 0) return;
 
   try {
-    const [files, orders, orderDocs, checks, checkAtts, procurement, users, settings, customerCodes] = await Promise.all([
+    const [files, orders, orderDocs, checks, checkAtts, procurement, users, settings, customerCodes, revisions] = await Promise.all([
       fetchAllRows(admin, 'files'),
       fetchAllRows(admin, 'orders'),
       fetchAllRows(admin, 'order_documents'),
@@ -121,6 +121,11 @@ export async function restoreFromSupabaseIfEmpty(clientOverride?: SupabaseClient
       fetchAllRows(admin, 'users'),
       fetchAllSettings(admin),
       fetchAllCustomerCodes(admin),
+      fetchAllRows(admin, 'order_revisions').catch((err) => {
+        // Table is created by migration 003; restoring orders must not fail if it was not run yet.
+        console.error('[Supabase restore] order_revisions:', err instanceof Error ? err.message : err);
+        return [] as Array<Record<string, unknown>>;
+      }),
     ]);
 
     if (orders.length + checks.length + procurement.length === 0 && users.every((u) => !u.pin_hash)) {
@@ -228,6 +233,21 @@ export async function restoreFromSupabaseIfEmpty(clientOverride?: SupabaseClient
       `);
       for (const s of settings) {
         upsSetting.run(s.key, s.value, toIso(s.updated_at));
+      }
+
+      const insRev = db.prepare(`
+        INSERT OR IGNORE INTO order_revisions (id, order_id, rev, sales_owner_id, sales_owner_name, customer,
+          return_reason, return_note, old_proforma, new_proforma, old_amount_toman, new_amount_toman,
+          changes_json, comparison_source, deleted_file_names, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const r of revisions) {
+        insRev.run(
+          r.id, r.order_id, r.rev, r.sales_owner_id, r.sales_owner_name, r.customer, r.return_reason ?? '',
+          r.return_note ?? '', r.old_proforma, r.new_proforma, r.old_amount_toman ?? null, r.new_amount_toman ?? null,
+          typeof r.changes_json === 'string' ? r.changes_json : JSON.stringify(r.changes_json ?? {}),
+          r.comparison_source ?? 'text', r.deleted_file_names ?? '', toIso(r.created_at),
+        );
       }
 
       const insCode = db.prepare(

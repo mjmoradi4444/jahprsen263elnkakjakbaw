@@ -278,10 +278,10 @@ export const api = {
   }) => apiRequest<{ order: OrderRecord }>('/api/orders', { method: 'POST', body: JSON.stringify(payload) }),
 
   /** Reads an uploaded proforma PDF on the server and returns suggested (editable) form values. */
-  extractInvoice: (fileId: string) =>
+  extractInvoice: (fileId: string, orderId?: string | null) =>
     apiRequest<InvoiceExtractionResponse>('/api/invoices/extract', {
       method: 'POST',
-      body: JSON.stringify({ fileId }),
+      body: JSON.stringify(orderId ? { fileId, orderId } : { fileId }),
     }),
 
   /** Instant duplicate check for a proforma number while the form is being filled. */

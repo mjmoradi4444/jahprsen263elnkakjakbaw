@@ -1,4 +1,5 @@
 import { SupabaseClient } from '@supabase/supabase-js';
+import { getSupabaseStorageAdminClient } from './supabase';
 import {
   CheckAttachmentRecord,
   CheckRecord,
@@ -473,4 +474,54 @@ export async function fetchIncrementalFromSupabase(
     console.error('[Supabase Incremental] Unexpected fetch error:', err);
     return null;
   }
+}
+
+
+/**
+ * Removes mirrored rows for proforma documents that were deleted locally (superseded by a
+ * revision), so a later restore-from-Supabase never brings back links to deleted files.
+ * Uses the server-only admin client because the mirror's RLS has no delete policies.
+ */
+export async function deleteDocumentMirrors(docIds: string[], fileIds: string[]): Promise<void> {
+  const admin = getSupabaseStorageAdminClient();
+  if (!admin) return;
+  if (docIds.length) {
+    const { error } = await admin.from('order_documents').delete().in('id', docIds);
+    if (error) console.error('[Supabase mirror] delete order_documents:', error.message);
+  }
+  if (fileIds.length) {
+    const { error } = await admin.from('files').delete().in('id', fileIds);
+    if (error) console.error('[Supabase mirror] delete files:', error.message);
+  }
+}
+
+export interface OrderRevisionRow {
+  id: string;
+  order_id: string;
+  rev: number;
+  sales_owner_id: string;
+  sales_owner_name: string;
+  customer: string;
+  return_reason: string;
+  return_note: string;
+  old_proforma: string;
+  new_proforma: string;
+  old_amount_toman: number | null;
+  new_amount_toman: number | null;
+  changes_json: string;
+  comparison_source: string;
+  deleted_file_names: string;
+  created_at: string;
+}
+
+/** Mirrors a revision record (needed for reports after a restore-from-Supabase). */
+export async function syncRevisionToSupabase(
+  supabase: SupabaseClient | null | undefined,
+  row: OrderRevisionRow,
+): Promise<void> {
+  if (!supabase) return;
+  const { error } = await supabase
+    .from('order_revisions')
+    .upsert({ ...row, changes_json: JSON.parse(row.changes_json) }, { onConflict: 'id', ignoreDuplicates: true });
+  if (error) console.error(`[Supabase RLS] Revision sync error (${row.id}):`, error.message);
 }

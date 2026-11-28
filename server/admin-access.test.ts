@@ -156,7 +156,7 @@ test('path traversal in stored backup names is refused', async () => {
 });
 
 test('admin audit entries are visible to the CEO only', async () => {
-  for (const role of ['sales_mgr', 'accounting']) {
+  for (const role of ['accounting', 'warehouse_sup']) {
     const res = await call('GET', '/logs?limit=100', tokens[role]);
     const { items } = await res.json();
     assert.ok(items.every((i: { category: string }) => i.category !== 'admin'), `${role} must not see admin logs`);

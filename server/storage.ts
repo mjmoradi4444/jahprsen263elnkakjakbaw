@@ -265,6 +265,41 @@ export async function readStoredFileStream(params: {
 }
 
 /**
+ * Permanently deletes a stored binary (local disk or Supabase Storage). Best effort: returns false
+ * instead of throwing, so a storage hiccup never breaks the request that triggered the cleanup.
+ */
+export async function deleteStoredFile(params: {
+  storageProvider: string;
+  storageBucket: string;
+  storagePath: string;
+  storedFilename: string;
+}): Promise<boolean> {
+  try {
+    if (params.storageProvider === 'supabase') {
+      const supabaseAdmin = getSupabaseStorageAdminClient();
+      if (!supabaseAdmin) return false;
+      const bucket = params.storageBucket || getSupabaseBucketName();
+      const { error } = await supabaseAdmin.storage.from(bucket).remove([params.storagePath]);
+      return !error;
+    }
+    const candidates = [
+      params.storagePath ? resolveConfinedLocalPath(params.storagePath) : null,
+      params.storedFilename ? resolveConfinedLocalPath(path.basename(params.storedFilename)) : null,
+    ].filter((p): p is string => Boolean(p));
+    let deleted = false;
+    for (const resolved of candidates) {
+      if (fs.existsSync(resolved)) {
+        fs.rmSync(resolved, { force: true });
+        deleted = true;
+      }
+    }
+    return deleted;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Generates a short-lived signed URL (default 60s) from Supabase Storage after server-side RBAC passes.
  * Returns null if the file is stored in local fallback mode (client continues using authenticated /api/files/:id proxy).
  */

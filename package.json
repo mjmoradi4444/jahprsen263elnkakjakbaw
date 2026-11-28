@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx --test src/shared/workflow.test.ts src/shared/sync.test.ts server/middleware/rbac.test.ts server/invoice-extract.test.ts server/admin-access.test.ts"
+    "test": "tsx --test src/shared/workflow.test.ts src/shared/sync.test.ts server/middleware/rbac.test.ts server/invoice-extract.test.ts server/admin-access.test.ts server/revisions-logs.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Download, FileText, Printer, Trash2, Upload, X, AlertTriangle } from 'lucide-react';
 import { api, ApiError } from '../api/client';
-import { OrderDocumentRecord, OrderRecord, TOP_BRANDS } from '../shared/types';
+import { DuplicateInvoiceInfo, InvoiceExtractionResponse, OrderDocumentRecord, OrderRecord, TOP_BRANDS } from '../shared/types';
+import { RevisionDiffList } from './RevisionDiff';
 import {
   computeCartonDiscrepancy,
   formatAmountToman,
@@ -859,6 +860,10 @@ export function ReviseOrderModal({ order, onClose, onDone }: ReviseOrderModalPro
   const [items, setItems] = useState('');
   const [uploadedFile, setUploadedFile] = useState<{ fileId: string; originalName: string } | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [reading, setReading] = useState(false);
+  const [readMessage, setReadMessage] = useState<{ tone: 'ok' | 'warn'; text: string } | null>(null);
+  const [comparison, setComparison] = useState<InvoiceExtractionResponse['comparison']>(null);
+  const [duplicate, setDuplicate] = useState<DuplicateInvoiceInfo | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -868,35 +873,100 @@ export function ReviseOrderModal({ order, onClose, onDone }: ReviseOrderModalPro
     setAmount(order.amountToman ? String(order.amountToman) : '');
     setItems(order.items);
     setUploadedFile(null);
+    setReadMessage(null);
+    setComparison(null);
+    setDuplicate(null);
     setError(null);
   }, [order]);
+
+  // Instant duplicate check of the proforma number (this order itself is excluded).
+  useEffect(() => {
+    if (!order) return;
+    const num = proforma.trim();
+    if (!num || num === order.proforma) {
+      setDuplicate(null);
+      return;
+    }
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      try {
+        const res = await api.checkProforma(num, order.id);
+        if (!cancelled) setDuplicate(res.duplicate);
+      } catch {
+        // the server re-checks on submit
+      }
+    }, 450);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [proforma, order]);
 
   if (!order) return null;
 
   async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
-    if (!file) return;
+    if (!file || !order) return;
     setError(null);
+    setReadMessage(null);
+    setComparison(null);
     if (file.size > 5 * 1024 * 1024) {
-      setError('حجم فایل بیشتر از ۵ مگابایت است. فایل‌های قبلی حفظ شدند.');
+      setError('حجم فایل بیشتر از ۵ مگابایت است.');
       e.target.value = '';
       return;
     }
     setUploading(true);
+    let uploaded: { fileId: string; originalName: string } | null = null;
     try {
       const res = await api.uploadFile(file, 'order_doc');
-      setUploadedFile({ fileId: res.fileId, originalName: res.originalName });
+      uploaded = { fileId: res.fileId, originalName: res.originalName };
+      setUploadedFile(uploaded);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'خطا در بارگذاری فایل.');
       e.target.value = '';
     } finally {
       setUploading(false);
     }
+    if (!uploaded) return;
+    if (file.type !== 'application/pdf') {
+      setReadMessage({ tone: 'warn', text: 'فایل تصویری خودکار خوانده نمی‌شود؛ اقلام و مبلغ را دستی اصلاح کنید. مقایسه از روی متن اقلام انجام می‌شود.' });
+      return;
+    }
+
+    setReading(true);
+    try {
+      const res = await api.extractInvoice(uploaded.fileId, order.id);
+      const r = res.result;
+      if (!r.ok) {
+        setReadMessage({ tone: 'warn', text: r.error || 'اطلاعات پیش‌فاکتور خوانده نشد؛ لطفاً دستی اصلاح کنید.' });
+        return;
+      }
+      if (r.invoiceNumber) setProforma(r.invoiceNumber);
+      if (r.amountToman) setAmount(String(r.amountToman));
+      if (r.itemsText) setItems(r.itemsText);
+      if (res.duplicate) setDuplicate(res.duplicate);
+      setComparison(res.comparison ?? null);
+      const hasWarnings = r.warnings && Object.keys(r.warnings).length > 0;
+      setReadMessage({
+        tone: hasWarnings ? 'warn' : 'ok',
+        text: hasWarnings
+          ? `اطلاعات از روی پیش‌فاکتور خوانده شد. بررسی کنید: ${Object.values(r.warnings!).join(' ')}`
+          : 'اطلاعات از روی پیش‌فاکتور جدید خوانده شد. لطفاً پیش از ثبت مرور کنید.',
+      });
+    } catch (err) {
+      setReadMessage({ tone: 'warn', text: err instanceof ApiError ? err.message : 'اطلاعات پیش‌فاکتور خوانده نشد؛ لطفاً دستی اصلاح کنید.' });
+    } finally {
+      setReading(false);
+    }
   }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!order || uploading) return;
+    if (!order || uploading || reading) return;
+    if (duplicate) {
+      setError(duplicate.message);
+      return;
+    }
     setError(null);
     setSubmitting(true);
     try {
@@ -907,7 +977,7 @@ export function ReviseOrderModal({ order, onClose, onDone }: ReviseOrderModalPro
         items: items.trim(),
         fileId: uploadedFile?.fileId || null,
       });
-      onDone(res.order, `اصلاحیه #${res.order.rev} پیش‌فاکتور ثبت و مجدداً به مدیر فروش ارسال شد.`);
+      onDone(res.order, `اصلاحیه #${res.order.rev} پیش‌فاکتور ثبت و مجدداً به مدیر فروش ارسال شد. مغایرت‌ها در گزارش ثبت شد.`);
       onClose();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'خطا در ثبت اصلاحیه.');
@@ -981,7 +1051,7 @@ export function ReviseOrderModal({ order, onClose, onDone }: ReviseOrderModalPro
 
           <div className="p-3.5 rounded-lg border border-dashed border-blue-300 bg-blue-50/40">
             <label htmlFor="rev-file" className="block text-xs font-bold text-blue-900 mb-1.5">
-              پیوست نسخه اصلاحی پیش‌فاکتور (PDF یا تصویر - نسخه‌های قبلی حفظ می‌شوند)
+              پیش‌فاکتور اصلاح‌شده را بارگذاری کنید (PDF تا خودکار خوانده شود)
             </label>
             <input
               id="rev-file"
@@ -995,7 +1065,42 @@ export function ReviseOrderModal({ order, onClose, onDone }: ReviseOrderModalPro
                 <Upload className="w-3.5 h-3.5" /> فایل آماده ثبت: {uploadedFile.originalName}
               </p>
             )}
+            {(uploading || reading) && (
+              <p className="text-[11px] text-blue-800 mt-1.5" role="status">
+                {uploading ? 'در حال بارگذاری...' : 'در حال خواندن اقلام از روی پیش‌فاکتور...'}
+              </p>
+            )}
+            {readMessage && (
+              <p
+                role="status"
+                className={`text-[11px] mt-1.5 font-semibold ${readMessage.tone === 'ok' ? 'text-emerald-700' : 'text-amber-800'}`}
+              >
+                {readMessage.text}
+              </p>
+            )}
+            <p className="text-[10px] text-slate-500 mt-1.5">
+              با ثبت اصلاحیه، فایل پیش‌فاکتور قبلی حذف می‌شود و فقط مغایرت اقلام، مقادیر و مبلغ در گزارش‌ها نگه داشته می‌شود.
+            </p>
           </div>
+
+          {comparison && (
+            <div className="p-3 rounded-lg border border-slate-200 bg-slate-50">
+              <div className="text-xs font-bold text-slate-900 mb-2">
+                مقایسه با پیش‌فاکتور قبلی <span className="font-mono-code" dir="ltr">{comparison.oldProforma}</span>
+              </div>
+              <RevisionDiffList
+                diff={comparison.changes.items}
+                oldAmountToman={comparison.oldAmountToman}
+                newAmountToman={comparison.newAmountToman}
+              />
+            </div>
+          )}
+
+          {duplicate && (
+            <div role="alert" className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs font-semibold text-red-700 flex gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0" /> {duplicate.message}
+            </div>
+          )}
 
           {error && (
             <div role="alert" className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs font-semibold text-red-700">
@@ -1005,7 +1110,7 @@ export function ReviseOrderModal({ order, onClose, onDone }: ReviseOrderModalPro
 
           <button
             type="submit"
-            disabled={submitting || uploading}
+            disabled={submitting || uploading || reading || !!duplicate}
             className="w-full py-2.5 px-4 rounded-lg bg-blue-700 hover:bg-blue-800 disabled:opacity-50 text-white text-sm font-bold cursor-pointer"
           >
             {submitting ? 'در حال ثبت...' : 'ثبت اصلاحیه و ارسال مجدد به مدیر فروش'}
