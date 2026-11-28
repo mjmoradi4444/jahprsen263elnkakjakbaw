@@ -1,6 +1,8 @@
 import {
   AuditLogEntry,
   CheckRecord,
+  DuplicateInvoiceInfo,
+  InvoiceExtractionResponse,
   IncrementalSyncResponse,
   OrderRecord,
   ProcurementItem,
@@ -270,7 +272,22 @@ export const api = {
     payment: string;
     items: string;
     fileId?: string | null;
+    customerCode?: string | null;
   }) => apiRequest<{ order: OrderRecord }>('/api/orders', { method: 'POST', body: JSON.stringify(payload) }),
+
+  /** Reads an uploaded proforma PDF on the server and returns suggested (editable) form values. */
+  extractInvoice: (fileId: string) =>
+    apiRequest<InvoiceExtractionResponse>('/api/invoices/extract', {
+      method: 'POST',
+      body: JSON.stringify({ fileId }),
+    }),
+
+  /** Instant duplicate check for a proforma number while the form is being filled. */
+  checkProforma: (num: string, excludeOrderId?: string | null) => {
+    const sp = new URLSearchParams({ number: num });
+    if (excludeOrderId) sp.set('excludeOrderId', excludeOrderId);
+    return apiRequest<{ duplicate: DuplicateInvoiceInfo | null }>(`/api/orders/check-proforma?${sp.toString()}`);
+  },
 
   advanceOrder: (id: string, expectedVersion: number) =>
     apiRequest<{ order: OrderRecord }>(`/api/orders/${encodeURIComponent(id)}/advance`, {

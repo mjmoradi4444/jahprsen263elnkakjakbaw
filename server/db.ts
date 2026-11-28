@@ -186,6 +186,14 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(id DESC);
+
+  -- Customer code (as printed on invoices) -> customer name, learned from submitted orders.
+  CREATE TABLE IF NOT EXISTS customer_codes (
+    code TEXT PRIMARY KEY,
+    customer_name TEXT NOT NULL,
+    updated_by TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
 `);
 
 // Idempotent column migrations for pre-existing local SQLite databases
@@ -575,7 +583,10 @@ function seedDemoRecordsIfEmpty(): void {
 }
 
 ensureRolesSeeded();
-seedDemoRecordsIfEmpty();
+// Demo orders/checks are only for local testing; never seed them into a real deployment.
+if (process.env.SEED_DEMO_DATA === '1') {
+  seedDemoRecordsIfEmpty();
+}
 
 // ==================== Helper Queries ====================
 export function getSetting(key: string): string {

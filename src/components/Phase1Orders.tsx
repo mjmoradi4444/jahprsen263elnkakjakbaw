@@ -14,6 +14,7 @@ import {
   Upload,
 } from 'lucide-react';
 import { api, ApiError, LogsListResponse, WhatsAppSummaryResponse } from '../api/client';
+import { NewOrderForm } from './NewOrderForm';
 import { buildOrdersViewState, computeLatestCursor, mergeIncrementalRecords } from '../shared/sync';
 import { OrderRecord, STAGES, UserAccountPublic } from '../shared/types';
 import {
@@ -62,18 +63,6 @@ export function Phase1Orders({ user, roles, refreshTrigger, onNotify, onDataChan
   const [reviseOrder, setReviseOrder] = useState<OrderRecord | null>(null);
   const [docModalState, setDocModalState] = useState<{ order: OrderRecord; mode: 'docs' | 'print' } | null>(null);
 
-  // New Order form state
-  const [fCustomer, setFCustomer] = useState('');
-  const [fProforma, setFProforma] = useState('');
-  const [fChannel, setFChannel] = useState('تلفنی');
-  const [fAmount, setFAmount] = useState('');
-  const [fPayment, setFPayment] = useState('نقدی / واریز آنی');
-  const [fItems, setFItems] = useState('');
-  const [fUploadedFile, setFUploadedFile] = useState<{ fileId: string; originalName: string } | null>(null);
-  const [fUploading, setFUploading] = useState(false);
-  const [fSubmitting, setFSubmitting] = useState(false);
-  const [fError, setFError] = useState<string | null>(null);
-
   // Logs & WhatsApp state
   const [logsData, setLogsData] = useState<LogsListResponse | null>(null);
   const [logsPage, setLogsPage] = useState(1);
@@ -86,7 +75,8 @@ export function Phase1Orders({ user, roles, refreshTrigger, onNotify, onDataChan
 
   const mergeOrderLocal = useCallback((updatedOrder: OrderRecord) => {
     setAllOrders((prev) => mergeIncrementalRecords(prev, [updatedOrder]));
-    lastSyncCursorRef.current = computeLatestCursor([updatedOrder.updatedAt], lastSyncCursorRef.current);
+    // Do not advance the sync cursor from a local action: other users' changes with earlier
+    // timestamps may not have been fetched yet and would otherwise be skipped forever.
   }, []);
 
   // Initial full role-scoped snapshot loaded ONCE (subsequent updates transfer ONLY `updated_at > cursor`)
@@ -122,6 +112,11 @@ export function Phase1Orders({ user, roles, refreshTrigger, onNotify, onDataChan
       lastSyncCursorRef.current = delta.cursor;
       if (delta.orders.length > 0) {
         setAllOrders((prev) => mergeIncrementalRecords(prev, delta.orders));
+      }
+      const removedIds = delta.removedOrderIds || [];
+      if (removedIds.length > 0) {
+        const removedSet = new Set(removedIds);
+        setAllOrders((prev) => prev.filter((r) => !removedSet.has(r.id)));
       }
     } catch {
       // Silently ignore transient incremental check failures; next tick or SSE ping retries
@@ -209,62 +204,14 @@ export function Phase1Orders({ user, roles, refreshTrigger, onNotify, onDataChan
     }
   }
 
-  async function handleNewOrderFile(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) {
-      setFUploadedFile(null);
-      return;
-    }
-    setFError(null);
-    if (file.size > 5 * 1024 * 1024) {
-      setFError('حجم فایل پیوست بیشتر از ۵ مگابایت است. لطفاً فایل کم‌حجم‌تری انتخاب کنید.');
-      e.target.value = '';
-      return;
-    }
-    setFUploading(true);
-    try {
-      const res = await api.uploadFile(file, 'order_doc');
-      setFUploadedFile({ fileId: res.fileId, originalName: res.originalName });
-    } catch (err) {
-      setFError(err instanceof ApiError ? err.message : 'خطا در بارگذاری فایل.');
-      e.target.value = '';
-    } finally {
-      setFUploading(false);
-    }
-  }
-
-  async function handleCreateOrder(e: React.FormEvent) {
-    e.preventDefault();
-    if (fSubmitting || fUploading) return;
-    setFError(null);
-    setFSubmitting(true);
-    try {
-      const res = await api.createOrder({
-        customer: fCustomer.trim(),
-        proforma: fProforma.trim(),
-        channel: fChannel,
-        amountToman: fAmount.trim(),
-        payment: fPayment,
-        items: fItems.trim(),
-        fileId: fUploadedFile?.fileId || null,
-      });
-      mergeOrderLocal(res.order);
-      setFCustomer('');
-      setFProforma('');
-      setFAmount('');
-      setFItems('');
-      setFUploadedFile(null);
-      onNotify(`پیش‌فاکتور ${res.order.proforma} با موفقیت ثبت و به مدیر فروش ارسال شد.`);
-      setSubTab('board');
-      setFilter('active');
-      setSelectedStage(null);
-      setPage(1);
-      onDataChanged();
-    } catch (err) {
-      setFError(err instanceof ApiError ? err.message : 'خطا در ثبت پیش‌فاکتور.');
-    } finally {
-      setFSubmitting(false);
-    }
+  function handleOrderCreated(order: OrderRecord) {
+    mergeOrderLocal(order);
+    onNotify(`پیش‌فاکتور ${order.proforma} با موفقیت ثبت و به مدیر فروش ارسال شد.`);
+    setSubTab('board');
+    setFilter('active');
+    setSelectedStage(null);
+    setPage(1);
+    onDataChanged();
   }
 
   async function handleCopyWaText() {
@@ -964,149 +911,7 @@ export function Phase1Orders({ user, roles, refreshTrigger, onNotify, onDataChan
       )}
 
       {/* TAB 2: NEW PROFORMA ORDER FORM */}
-      {subTab === 'new' && user.isSales && (
-        <form onSubmit={handleCreateOrder} className="bg-white border border-slate-200 rounded-xl p-6 max-w-2xl space-y-4">
-          <div>
-            <h2 className="text-base font-extrabold text-slate-900">ثبت پیش‌فاکتور جدید و ارسال به مدیر فروش</h2>
-            <p className="text-xs text-slate-500 mt-0.5">
-              شماره پیش‌فاکتور از نظر تکراری نبودن روی سرور بررسی شده و مبلغ به‌صورت عدد ساختاریافته ذخیره می‌شود.
-            </p>
-          </div>
-
-          <div>
-            <label htmlFor="new-customer" className="block text-xs font-bold text-slate-800 mb-1">
-              نام فروشگاه / مشتری *
-            </label>
-            <input
-              id="new-customer"
-              type="text"
-              required
-              value={fCustomer}
-              onChange={(e) => setFCustomer(e.target.value)}
-              placeholder="مثلاً: لوازم یدکی مرکزی سایپا - کرج"
-              className="w-full px-3.5 py-2 text-sm border border-slate-300 rounded-lg"
-            />
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div>
-              <label htmlFor="new-proforma" className="block text-xs font-bold text-slate-800 mb-1">
-                شماره پیش‌فاکتور (یکتا) *
-              </label>
-              <input
-                id="new-proforma"
-                type="text"
-                dir="ltr"
-                required
-                value={fProforma}
-                onChange={(e) => setFProforma(e.target.value)}
-                placeholder="PF-5020"
-                className="w-full px-3.5 py-2 text-sm border border-slate-300 rounded-lg font-mono-code"
-              />
-            </div>
-            <div>
-              <label htmlFor="new-channel" className="block text-xs font-bold text-slate-800 mb-1">
-                کانال دریافت سفارش
-              </label>
-              <select
-                id="new-channel"
-                value={fChannel}
-                onChange={(e) => setFChannel(e.target.value)}
-                className="w-full px-3.5 py-2 text-sm border border-slate-300 rounded-lg bg-white"
-              >
-                <option value="تلفنی">تلفنی</option>
-                <option value="روبیکا">گروه روبیکا</option>
-                <option value="ایتا">گروه ایتا</option>
-                <option value="اپلیکیشن">اپلیکیشن</option>
-                <option value="حضوری">حضوری</option>
-              </select>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div>
-              <label htmlFor="new-amount" className="block text-xs font-bold text-slate-800 mb-1">
-                مبلغ پیش‌فاکتور (تومان — عددی) *
-              </label>
-              <input
-                id="new-amount"
-                type="text"
-                dir="ltr"
-                required
-                value={fAmount}
-                onChange={(e) => setFAmount(e.target.value)}
-                placeholder="75000000"
-                className="w-full px-3.5 py-2 text-sm border border-slate-300 rounded-lg font-mono-code"
-              />
-            </div>
-            <div>
-              <label htmlFor="new-payment" className="block text-xs font-bold text-slate-800 mb-1">
-                شرایط تسویه
-              </label>
-              <select
-                id="new-payment"
-                value={fPayment}
-                onChange={(e) => setFPayment(e.target.value)}
-                className="w-full px-3.5 py-2 text-sm border border-slate-300 rounded-lg bg-white"
-              >
-                <option value="نقدی / واریز آنی">نقدی / واریز آنی</option>
-                <option value="چک صیادی ۴۵ روزه">چک صیادی ۴۵ روزه</option>
-                <option value="اعتباری / حساب باز">اعتباری / حساب باز</option>
-              </select>
-            </div>
-          </div>
-
-          <div>
-            <label htmlFor="new-items" className="block text-xs font-bold text-slate-800 mb-1">
-              شرح اقلام و برندها (ایران‌خودرو / سایپا) *
-            </label>
-            <textarea
-              id="new-items"
-              rows={3}
-              required
-              value={fItems}
-              onChange={(e) => setFItems(e.target.value)}
-              placeholder="مثلاً: دیسک و صفحه عظام پژو ۴۰۵ (۶ دست) + لنت جلو کروز پراید (۱۰ دست)"
-              className="w-full px-3.5 py-2 text-sm border border-slate-300 rounded-lg"
-            />
-          </div>
-
-          <div className="p-4 rounded-lg border border-dashed border-blue-300 bg-blue-50/40">
-            <label htmlFor="new-pdf-file" className="block text-xs font-bold text-blue-900 mb-1.5">
-              بارگذاری فایل PDF یا تصویر پیش‌فاکتور (حداکثر ۵ مگابایت)
-            </label>
-            <input
-              id="new-pdf-file"
-              type="file"
-              accept="application/pdf,image/png,image/jpeg,image/webp"
-              onChange={handleNewOrderFile}
-              className="w-full text-xs text-slate-700"
-            />
-            <p className="text-[11px] text-blue-800 mt-1.5">
-              {fUploading
-                ? 'در حال اعتبارسنجی امنیتی و ذخیره فایل روی سرور...'
-                : fUploadedFile
-                  ? `فایل پیوست آماده است: ${fUploadedFile.originalName}`
-                  : 'فایل‌ها روی سرور ذخیره شده و بدون بارگذاری مجدد در مرورگر به‌صورت ایمن نمایش داده می‌شوند.'}
-            </p>
-          </div>
-
-          {fError && (
-            <div role="alert" className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs font-semibold text-red-700">
-              {fError}
-            </div>
-          )}
-
-          <button
-            type="submit"
-            disabled={fSubmitting || fUploading}
-            className="w-full py-2.5 px-4 rounded-lg bg-blue-700 hover:bg-blue-800 disabled:opacity-50 text-white text-sm font-bold cursor-pointer inline-flex items-center justify-center gap-2"
-          >
-            <Upload className="w-4 h-4" />
-            {fSubmitting ? 'در حال ثبت سفارش...' : 'ثبت پیش‌فاکتور و ارسال به مدیر فروش'}
-          </button>
-        </form>
-      )}
+      {subTab === 'new' && user.isSales && <NewOrderForm onCreated={handleOrderCreated} />}
 
       {/* TAB 3: AUDIT LOGS & BOUNDED WHATSAPP REPORT */}
       {subTab === 'logs' && (

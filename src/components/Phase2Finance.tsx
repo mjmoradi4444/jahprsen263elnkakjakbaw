@@ -61,7 +61,8 @@ export function Phase2Finance({ user, roles, refreshTrigger, onNotify, onDataCha
 
   const mergeCheckLocal = useCallback((updatedCheck: CheckRecord) => {
     setAllChecks((prev) => mergeIncrementalRecords(prev, [updatedCheck]));
-    lastSyncCursorRef.current = computeLatestCursor([updatedCheck.updatedAt], lastSyncCursorRef.current);
+    // Do not advance the sync cursor from a local action: other users' changes with earlier
+    // timestamps may not have been fetched yet and would otherwise be skipped forever.
   }, []);
 
   const loadInitialChecks = useCallback(async () => {
@@ -95,6 +96,11 @@ export function Phase2Finance({ user, roles, refreshTrigger, onNotify, onDataCha
       lastSyncCursorRef.current = delta.cursor;
       if (delta.checks.length > 0) {
         setAllChecks((prev) => mergeIncrementalRecords(prev, delta.checks));
+      }
+      const removedIds = delta.removedCheckIds || [];
+      if (removedIds.length > 0) {
+        const removedSet = new Set(removedIds);
+        setAllChecks((prev) => prev.filter((r) => !removedSet.has(r.id)));
       }
     } catch {
       // Transient sync errors are retried on next incremental tick

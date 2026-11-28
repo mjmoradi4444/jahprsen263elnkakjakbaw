@@ -42,3 +42,24 @@
    - `SUPABASE_STORAGE_BUCKET` (پیش‌فرض: `autoparts-documents`)
 3. اجرای توسعه: `npm run dev` | ساخت تولید: `npm run build` و اجرا با `npm start`.
 4. در اولین ورود، صفحه راه‌اندازی اولیه برای تعیین رمز مدیرعامل نمایش داده می‌شود (یا می‌توان `CEO_INITIAL_PIN` را در متغیرهای محیطی تنظیم کرد).
+
+## Invoice auto-fill (proforma PDF)
+
+Sales reps upload the proforma PDF first; the server reads it and pre-fills the form. All fields stay editable.
+
+- Items table, line totals and the totals row are real text in the PDF: read with `pdfjs-dist`.
+- Invoice number, date and buyer code are drawn as graphics: read with offline OCR (`tesseract.js`, digits only, language data bundled from `@tesseract.js-data/eng`). No invoice data leaves the server.
+- Amounts on the invoice are in **rial**; the form stores **toman** (÷ 10).
+- Buyer code → customer name is learned from submitted orders (`customer_codes` table).
+- Cross-checks highlight fields in yellow: line totals vs. totals row, OCR number vs. digits in the file name.
+- The OCR regions in `server/invoice-extract.ts` match the current accounting-software template. If the template changes, update `OCR_REGIONS` / `COLUMN_BANDS`.
+
+Duplicate proforma and final-invoice numbers are rejected with the original registrant and Jalali date/time (Tehran).
+
+## Deployment notes
+
+- `npm start` runs `tsx server.ts` in production mode after `npm run build`.
+- Run both SQL files in `supabase/migrations/` (001 then 002) in the Supabase SQL editor.
+- Environment: `CEO_INITIAL_PIN`, `SESSION_SECRET`, `TRUST_PROXY=1` behind a proxy, and the `SUPABASE_*` variables. Never set `SEED_DEMO_DATA` in production.
+- SQLite is the live database; every write is mirrored to Supabase. If the server starts with an empty disk, data (orders, checks, procurement, files metadata, accounts, settings, customer codes) is restored from Supabase automatically. A persistent disk is still recommended.
+- `npm test` runs all unit tests.

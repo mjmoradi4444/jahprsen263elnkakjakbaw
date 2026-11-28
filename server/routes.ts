@@ -33,12 +33,14 @@ import {
   uploadFileToStorage,
 } from './storage';
 import {
-  fetchIncrementalFromSupabase,
   syncCheckToSupabase,
   syncFileMetadataToSupabase,
   syncOrderToSupabase,
   syncProcurementToSupabase,
+  logMirrorError,
 } from './supabase-sync';
+import { mirrorUsersAndSettingsToSupabase } from './supabase-restore';
+import { extractInvoiceFields } from './invoice-extract';
 import {
   AuditLogEntry,
   CheckRecord,
@@ -124,6 +126,99 @@ function createSessionForUser(userId: string): { token: string; expiresAt: strin
 }
 
 // ==================== Express Router ====================
+/**
+ * Multer decodes multipart file names as latin1, which turns Persian names into mojibake.
+ * Re-decode as UTF-8 when the bytes form valid UTF-8; otherwise keep the original string.
+ */
+export function decodeUploadFileName(name: string): string {
+  if (!name || /[^\u0000-\u00ff]/.test(name)) return name; // already proper Unicode
+  const decoded = Buffer.from(name, 'latin1').toString('utf8');
+  return decoded.includes('\uFFFD') ? name : decoded;
+}
+
+// ==================== Duplicate invoice detection ====================
+const TEHRAN_DATE_FMT = new Intl.DateTimeFormat('fa-IR', {
+  timeZone: 'Asia/Tehran',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+const TEHRAN_TIME_FMT = new Intl.DateTimeFormat('fa-IR', {
+  timeZone: 'Asia/Tehran',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+});
+
+function formatTehranDateTime(iso: string): { date: string; time: string } {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return { date: iso, time: '' };
+  return { date: TEHRAN_DATE_FMT.format(d), time: TEHRAN_TIME_FMT.format(d) };
+}
+
+export interface DuplicateInvoiceInfo {
+  orderId: string;
+  number: string;
+  registeredBy: string;
+  registeredAt: string;
+  message: string;
+}
+
+/** Finds an existing order with the same proforma number (case/digit-insensitive). */
+export function findDuplicateProforma(proforma: string, excludeOrderId: string | null = null): DuplicateInvoiceInfo | null {
+  const row = db
+    .prepare(
+      `SELECT id, proforma, sales_owner_name, created_at FROM orders WHERE lower(proforma) = lower(?) AND id != ? LIMIT 1`,
+    )
+    .get(proforma, excludeOrderId ?? '') as
+    | { id: string; proforma: string; sales_owner_name: string; created_at: string }
+    | undefined;
+  if (!row) return null;
+  const { date, time } = formatTehranDateTime(row.created_at);
+  return {
+    orderId: row.id,
+    number: row.proforma,
+    registeredBy: row.sales_owner_name,
+    registeredAt: row.created_at,
+    message: `این شماره پیش‌فاکتور («${row.proforma}») قبلاً توسط «${row.sales_owner_name}» در تاریخ ${date} ساعت ${time} ثبت شده است.`,
+  };
+}
+
+/** Finds another order that already uses this final invoice number, with who issued it and when. */
+export function findDuplicateFinalInvoice(finalInvoiceNo: string, excludeOrderId: string): DuplicateInvoiceInfo | null {
+  const row = db
+    .prepare(
+      `SELECT id, final_invoice_no, proforma, customer, stage_history_json, updated_at
+       FROM orders WHERE final_invoice_no != '' AND lower(final_invoice_no) = lower(?) AND id != ? LIMIT 1`,
+    )
+    .get(finalInvoiceNo, excludeOrderId) as
+    | { id: string; final_invoice_no: string; proforma: string; customer: string; stage_history_json: string; updated_at: string }
+    | undefined;
+  if (!row) return null;
+
+  // The stage-4 history entry records who issued the final invoice and when.
+  let issuedBy = 'واحد حسابداری';
+  let issuedAt = row.updated_at;
+  try {
+    const history = JSON.parse(row.stage_history_json || '[]') as StageHistoryEntry[];
+    const issue = [...history].reverse().find((h) => h.stage === 4);
+    if (issue) {
+      issuedBy = issue.actorName || issuedBy;
+      issuedAt = issue.timestamp || issuedAt;
+    }
+  } catch {
+    // keep defaults
+  }
+  const { date, time } = formatTehranDateTime(issuedAt);
+  return {
+    orderId: row.id,
+    number: row.final_invoice_no,
+    registeredBy: issuedBy,
+    registeredAt: issuedAt,
+    message: `این شماره فاکتور نهایی («${row.final_invoice_no}») قبلاً توسط «${issuedBy}» در تاریخ ${date} ساعت ${time} برای پیش‌فاکتور «${row.proforma}» (مشتری «${row.customer}») ثبت شده است.`,
+  };
+}
+
 export function createApiRouter(): express.Router {
   const router = express.Router();
 
@@ -216,6 +311,7 @@ export function createApiRouter(): express.Router {
 
     const user = getPublicUser('ceo')!;
     const session = createSessionForUser('ceo');
+    void mirrorUsersAndSettingsToSupabase();
     res.status(201).json({ token: session.token, expiresAt: session.expiresAt, user });
   });
 
@@ -353,7 +449,7 @@ export function createApiRouter(): express.Router {
       try {
         const stored = await uploadFileToStorage({
           buffer: req.file.buffer,
-          originalName: req.file.originalname,
+          originalName: decodeUploadFileName(req.file.originalname),
           ownerKind,
           allowPdf,
         });
@@ -379,7 +475,11 @@ export function createApiRouter(): express.Router {
           now,
         );
 
-        await syncFileMetadataToSupabase(req.supabase, stored, ownerKind, null, req.user!.id);
+        // The Supabase metadata row is only a mirror: a mirror failure must never fail the upload
+        // (the binary and the authoritative SQLite row are already stored at this point).
+        await syncFileMetadataToSupabase(req.supabase, stored, ownerKind, null, req.user!.id).catch(
+          logMirrorError('file', stored.fileId),
+        );
 
         res.status(201).json({
           fileId: stored.fileId,
@@ -544,6 +644,7 @@ export function createApiRouter(): express.Router {
   });
 
   // ==================== Incremental Fetching Endpoint (`updated_at > since`) ====================
+  const SYNC_OVERLAP_MS = 5_000;
   router.get('/sync', requireAuth, async (req: AuthedRequest, res) => {
     const user = req.user!;
     const rawSince = req.query.since;
@@ -555,66 +656,68 @@ export function createApiRouter(): express.Router {
     const since = parseSinceCursor(rawSince);
     const serverTime = new Date().toISOString();
 
-    let source: 'supabase' | 'local' = 'local';
+    // SQLite is the authoritative store (Supabase is a mirror), so deltas always come from SQLite.
+    // Reading the mirror here could miss writes whose mirror call failed or is still in flight.
+    const source: 'supabase' | 'local' = 'local';
     let orders: OrderRecord[] = [];
     let checks: CheckRecord[] = [];
     let procurement: ProcurementItem[] = [];
+    const removedOrderIds: string[] = [];
+    const removedCheckIds: string[] = [];
+    const allChangedTimestamps: string[] = [];
 
-    // Prefer Supabase incremental fetch (`updated_at > since`) under role-scoped RLS when configured
-    const supabaseDelta = await fetchIncrementalFromSupabase(req.supabase, user, since);
-    if (supabaseDelta) {
-      source = 'supabase';
-      orders = supabaseDelta.orders
-        .filter((o) => canRoleViewOrder(user.id, o))
-        .map((o) => projectOrderForRole(user.id, o));
-      checks = canRoleAccessFinance(user.id)
-        ? supabaseDelta.checks.filter((c) => (user.isSales ? c.salesOwnerId === user.id : true))
-        : [];
-      procurement = canRoleAccessProcurement(user.id) ? supabaseDelta.procurement : [];
-    } else {
-      // Parameterized SQLite incremental query (`WHERE updated_at > ?`)
-      const orderRows = since
-        ? (db
-            .prepare(`SELECT * FROM orders WHERE updated_at > ? ORDER BY updated_at DESC`)
-            .all(since) as Array<Record<string, unknown>>)
-        : (db.prepare(`SELECT * FROM orders ORDER BY updated_at DESC`).all() as Array<Record<string, unknown>>);
+    // Re-read a small overlap window before the cursor so a write that committed slightly out of
+    // timestamp order is never skipped. The client merges by id, so duplicates are harmless.
+    const sinceQuery = since ? new Date(Date.parse(since) - SYNC_OVERLAP_MS).toISOString() : null;
 
-      orders = orderRows
-        .map(hydrateOrderRow)
-        .filter((o) => canRoleViewOrder(user.id, o))
-        .map((o) => projectOrderForRole(user.id, o));
+    const orderRows = sinceQuery
+      ? (db
+          .prepare(`SELECT * FROM orders WHERE updated_at > ? ORDER BY updated_at DESC`)
+          .all(sinceQuery) as Array<Record<string, unknown>>)
+      : (db.prepare(`SELECT * FROM orders ORDER BY updated_at DESC`).all() as Array<Record<string, unknown>>);
 
-      if (canRoleAccessFinance(user.id)) {
-        const checkRows = since
-          ? (db
-              .prepare(`SELECT * FROM checks WHERE updated_at > ? ORDER BY updated_at DESC`)
-              .all(since) as Array<Record<string, unknown>>)
-          : (db.prepare(`SELECT * FROM checks ORDER BY updated_at DESC`).all() as Array<Record<string, unknown>>);
-
-        checks = checkRows
-          .map(hydrateCheckRow)
-          .filter((c) => (user.isSales ? c.salesOwnerId === user.id : true));
-      }
-
-      if (canRoleAccessProcurement(user.id)) {
-        const procRows = since
-          ? (db
-              .prepare(`SELECT * FROM procurement_items WHERE updated_at > ? ORDER BY updated_at DESC`)
-              .all(since) as Array<Record<string, unknown>>)
-          : (db
-              .prepare(`SELECT * FROM procurement_items ORDER BY updated_at DESC`)
-              .all() as Array<Record<string, unknown>>);
-
-        procurement = procRows.map(hydrateProcurementRow);
+    for (const order of orderRows.map(hydrateOrderRow)) {
+      allChangedTimestamps.push(order.updatedAt);
+      if (canRoleViewOrder(user.id, order)) {
+        orders.push(projectOrderForRole(user.id, order));
+      } else if (sinceQuery) {
+        // Changed and no longer visible to this role (e.g. returned to an earlier stage): tell the
+        // client to drop its stale copy. Only the id is sent, never the record contents.
+        removedOrderIds.push(order.id);
       }
     }
 
-    const timestamps = [
-      ...orders.map((o) => o.updatedAt),
-      ...checks.map((c) => c.updatedAt),
-      ...procurement.map((p) => p.updatedAt),
-    ];
-    const cursor = computeLatestCursor(timestamps, since) || serverTime;
+    if (canRoleAccessFinance(user.id)) {
+      const checkRows = sinceQuery
+        ? (db
+            .prepare(`SELECT * FROM checks WHERE updated_at > ? ORDER BY updated_at DESC`)
+            .all(sinceQuery) as Array<Record<string, unknown>>)
+        : (db.prepare(`SELECT * FROM checks ORDER BY updated_at DESC`).all() as Array<Record<string, unknown>>);
+
+      for (const chk of checkRows.map(hydrateCheckRow)) {
+        allChangedTimestamps.push(chk.updatedAt);
+        if (!user.isSales || chk.salesOwnerId === user.id) {
+          checks.push(chk);
+        } else if (sinceQuery) {
+          removedCheckIds.push(chk.id);
+        }
+      }
+    }
+
+    if (canRoleAccessProcurement(user.id)) {
+      const procRows = sinceQuery
+        ? (db
+            .prepare(`SELECT * FROM procurement_items WHERE updated_at > ? ORDER BY updated_at DESC`)
+            .all(sinceQuery) as Array<Record<string, unknown>>)
+        : (db
+            .prepare(`SELECT * FROM procurement_items ORDER BY updated_at DESC`)
+            .all() as Array<Record<string, unknown>>);
+
+      procurement = procRows.map(hydrateProcurementRow);
+      allChangedTimestamps.push(...procurement.map((p) => p.updatedAt));
+    }
+
+    const cursor = computeLatestCursor(allChangedTimestamps, since) || serverTime;
     const payload: IncrementalSyncResponse = {
       cursor,
       serverTime,
@@ -625,6 +728,8 @@ export function createApiRouter(): express.Router {
       orders,
       checks,
       procurement,
+      removedOrderIds,
+      removedCheckIds,
     };
     res.json(payload);
   });
@@ -743,6 +848,88 @@ export function createApiRouter(): express.Router {
   });
 
   // Create new proforma order (sales reps only via RBAC middleware, duplicate proforma guard, structured numeric amount)
+  // ==================== Invoice auto-fill (server-side PDF text + header OCR) ====================
+  // The rep uploads the invoice first (POST /files), then asks the server to read it. Only the
+  // uploader may read their own not-yet-attached file. Nothing leaves the server.
+  router.post('/invoices/extract', requireAuth, requireSalesRole, async (req: AuthedRequest, res) => {
+    const user = req.user!;
+    const fileId = String(req.body?.fileId || '').trim();
+    const fileRow = db
+      .prepare(
+        `SELECT id, storage_provider, storage_bucket, storage_path, stored_filename, original_name, mime_type, uploaded_by, owner_record_id FROM files WHERE id = ?`,
+      )
+      .get(fileId) as
+      | {
+          id: string;
+          storage_provider: string;
+          storage_bucket: string;
+          storage_path: string;
+          stored_filename: string;
+          original_name: string;
+          mime_type: string;
+          uploaded_by: string;
+          owner_record_id: string | null;
+        }
+      | undefined;
+
+    if (!fileRow || fileRow.uploaded_by !== user.id || fileRow.owner_record_id) {
+      res.status(404).json({ error: 'فایل بارگذاری‌شده پیدا نشد.' });
+      return;
+    }
+    if (fileRow.mime_type !== 'application/pdf') {
+      res.json({
+        result: {
+          ok: false,
+          error: 'خواندن خودکار فقط برای فایل PDF فاکتور ممکن است؛ لطفاً اطلاعات را دستی وارد کنید.',
+        },
+      });
+      return;
+    }
+
+    const streamResult = await fetchFileFromStorage({
+      storageProvider: fileRow.storage_provider,
+      storageBucket: fileRow.storage_bucket,
+      storagePath: fileRow.storage_path,
+      storedFilename: fileRow.stored_filename,
+    });
+    if (!streamResult) {
+      res.status(404).json({ error: 'فایل در مخزن ذخیره‌سازی یافت نشد.' });
+      return;
+    }
+    const chunks: Buffer[] = [];
+    for await (const chunk of streamResult.stream) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+
+    const result = await extractInvoiceFields(Buffer.concat(chunks), fileRow.original_name);
+
+    // Customer name: look up the buyer code learned from earlier orders.
+    let customerName: string | null = null;
+    if (result.buyerCode) {
+      const row = db.prepare(`SELECT customer_name FROM customer_codes WHERE code = ?`).get(result.buyerCode) as
+        | { customer_name: string }
+        | undefined;
+      customerName = row?.customer_name ?? null;
+    }
+
+    // Duplicate check right away, so the rep sees it before filling anything else.
+    const duplicate = result.invoiceNumber ? findDuplicateProforma(result.invoiceNumber) : null;
+
+    res.json({ result, customerName, duplicate });
+  });
+
+  // Instant duplicate check while the rep is filling the form (before submit).
+  router.get('/orders/check-proforma', requireAuth, requireSalesRole, (req: AuthedRequest, res) => {
+    const number = normalizeDigits(String(req.query.number || '')).trim();
+    const excludeOrderId = req.query.excludeOrderId ? String(req.query.excludeOrderId) : null;
+    if (!number || number.length > 60) {
+      res.json({ duplicate: null });
+      return;
+    }
+    const dup = findDuplicateProforma(number, excludeOrderId);
+    res.json({ duplicate: dup });
+  });
+
   router.post('/orders', requireAuth, requireSalesRole, async (req: AuthedRequest, res) => {
     const user = req.user!;
 
@@ -753,6 +940,9 @@ export function createApiRouter(): express.Router {
     const items = String(req.body?.items || '').trim();
     const amountParsed = parseAmountToman(req.body?.amountToman ?? req.body?.amount);
     const fileId = req.body?.fileId ? String(req.body.fileId).trim() : null;
+    // Buyer code read from the invoice (optional). Used to remember code -> customer name.
+    const customerCodeRaw = normalizeDigits(String(req.body?.customerCode || '')).trim();
+    const customerCode = /^\d{2,12}$/.test(customerCodeRaw) ? customerCodeRaw : null;
 
     if (!customer || !proforma || !items) {
       res.status(400).json({ error: 'نام مشتری، شماره پیش‌فاکتور و شرح اقلام الزامی است.' });
@@ -763,11 +953,9 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    const dup = db
-      .prepare(`SELECT id FROM orders WHERE lower(proforma) = lower(?)`)
-      .get(proforma) as { id: string } | undefined;
+    const dup = findDuplicateProforma(proforma);
     if (dup) {
-      res.status(409).json({ error: `شماره پیش‌فاکتور «${proforma}» قبلاً در سامانه ثبت شده است.` });
+      res.status(409).json({ error: dup.message, duplicate: dup });
       return;
     }
 
@@ -828,8 +1016,23 @@ export function createApiRouter(): express.Router {
     });
 
     tx();
+
+    if (customerCode) {
+      db.prepare(`
+        INSERT INTO customer_codes (code, customer_name, updated_by, updated_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT(code) DO UPDATE SET customer_name = excluded.customer_name,
+          updated_by = excluded.updated_by, updated_at = excluded.updated_at
+      `).run(customerCode, customer, user.id, now);
+      if (req.supabase) {
+        const { error: codeErr } = await req.supabase
+          .from('customer_codes')
+          .upsert({ code: customerCode, customer_name: customer, updated_by: user.id, updated_at: now }, { onConflict: 'code' });
+        if (codeErr) console.error(`[Supabase mirror] customer code ${customerCode}:`, codeErr.message);
+      }
+    }
+
     const created = hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(orderId) as Record<string, unknown>);
-    await syncOrderToSupabase(req.supabase, created).catch(() => {});
+    await syncOrderToSupabase(req.supabase, created).catch(logMirrorError('order', created.id));
     broadcastChange('orders');
     res.status(201).json({ order: created });
   });
@@ -897,7 +1100,7 @@ export function createApiRouter(): express.Router {
       );
 
       const fresh = hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order.id) as Record<string, unknown>);
-      await syncOrderToSupabase(req.supabase, fresh).catch(() => {});
+      await syncOrderToSupabase(req.supabase, fresh).catch(logMirrorError('order', fresh.id));
       broadcastChange('orders');
       res.json({ order: fresh });
     },
@@ -944,7 +1147,7 @@ export function createApiRouter(): express.Router {
 
     addAuditLog(user.id, user.displayName, 'order', `مدیر فروش مغایرت پیش‌فاکتور «${order.proforma}» (${order.customer}) را بررسی و به حسابداری ارسال کرد.`);
     const fresh = hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order.id) as Record<string, unknown>);
-    await syncOrderToSupabase(req.supabase, fresh).catch(() => {});
+    await syncOrderToSupabase(req.supabase, fresh).catch(logMirrorError('order', fresh.id));
     broadcastChange('orders');
     res.json({ order: fresh });
   });
@@ -983,6 +1186,11 @@ export function createApiRouter(): express.Router {
 
     if (!finalInvoiceNo) {
       res.status(400).json({ error: 'شماره فاکتور فروش نهایی الزامی است.' });
+      return;
+    }
+    const dupFinal = findDuplicateFinalInvoice(finalInvoiceNo, order.id);
+    if (dupFinal) {
+      res.status(409).json({ error: dupFinal.message, duplicate: dupFinal });
       return;
     }
     if (amountParsed === null || amountParsed <= 0) {
@@ -1082,7 +1290,7 @@ export function createApiRouter(): express.Router {
     }
 
     const fresh = hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order.id) as Record<string, unknown>);
-    await syncOrderToSupabase(req.supabase, fresh).catch(() => {});
+    await syncOrderToSupabase(req.supabase, fresh).catch(logMirrorError('order', fresh.id));
     broadcastChange('orders');
     res.json({ order: fresh });
   });
@@ -1149,7 +1357,7 @@ export function createApiRouter(): express.Router {
     );
 
     const fullFresh = hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order.id) as Record<string, unknown>);
-    await syncOrderToSupabase(req.supabase, fullFresh).catch(() => {});
+    await syncOrderToSupabase(req.supabase, fullFresh).catch(logMirrorError('order', fullFresh.id));
     const fresh = projectOrderForRole(user.id, fullFresh);
     broadcastChange('orders');
     res.json({ order: fresh });
@@ -1270,7 +1478,7 @@ export function createApiRouter(): express.Router {
       }
 
       const fullFresh = hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order.id) as Record<string, unknown>);
-      await syncOrderToSupabase(req.supabase, fullFresh).catch(() => {});
+      await syncOrderToSupabase(req.supabase, fullFresh).catch(logMirrorError('order', fullFresh.id));
       const fresh = projectOrderForRole(user.id, fullFresh);
       broadcastChange('orders');
       res.json({ order: fresh });
@@ -1278,7 +1486,7 @@ export function createApiRouter(): express.Router {
   );
 
   // Return order (with optional automatic Phase 3 shortage log when warehouse reports shortage!)
-  router.post('/orders/:id/return', requireAuth, (req: AuthedRequest, res) => {
+  router.post('/orders/:id/return', requireAuth, async (req: AuthedRequest, res) => {
     const user = req.user!;
     const expectedVersion = Number(req.body?.expectedVersion);
     const check = getOrderWithVersionCheck(String(req.params.id), expectedVersion);
@@ -1352,6 +1560,7 @@ export function createApiRouter(): express.Router {
       },
     ];
 
+    let shortageProcId: string | null = null;
     const tx = db.transaction(() => {
       const updated = db
         .prepare(`
@@ -1365,6 +1574,7 @@ export function createApiRouter(): express.Router {
 
       if (target === 'accounting' && createShortageTicket) {
         const procId = `proc-${crypto.randomUUID().slice(0, 8)}`;
+        shortageProcId = procId;
         db.prepare(`
           INSERT INTO procurement_items (
             id, version, brand, part_name, part_code, qty_needed, priority, status,
@@ -1401,10 +1611,21 @@ export function createApiRouter(): express.Router {
       throw e;
     }
 
-    const fresh = projectOrderForRole(
-      user.id,
-      hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order.id) as Record<string, unknown>),
+    // Mirror the full (unmasked) record; only the response is projected for the caller's role.
+    const fullReturned = hydrateOrderRow(
+      db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order.id) as Record<string, unknown>,
     );
+    await syncOrderToSupabase(req.supabase, fullReturned).catch(logMirrorError('order', fullReturned.id));
+    if (shortageProcId) {
+      const procRow = db.prepare(`SELECT * FROM procurement_items WHERE id = ?`).get(shortageProcId) as
+        | Record<string, unknown>
+        | undefined;
+      if (procRow) {
+        const procItem = hydrateProcurementRow(procRow);
+        await syncProcurementToSupabase(req.supabase, procItem).catch(logMirrorError('procurement item', procItem.id));
+      }
+    }
+    const fresh = projectOrderForRole(user.id, fullReturned);
     broadcastChange('orders');
     if (createShortageTicket) broadcastChange('procurement');
     res.json({ order: fresh });
@@ -1439,11 +1660,9 @@ export function createApiRouter(): express.Router {
     }
 
     if (newProforma.toLowerCase() !== order.proforma.toLowerCase()) {
-      const dup = db
-        .prepare(`SELECT id FROM orders WHERE lower(proforma) = lower(?) AND id != ?`)
-        .get(newProforma, order.id) as { id: string } | undefined;
+      const dup = findDuplicateProforma(newProforma, order.id);
       if (dup) {
-        res.status(409).json({ error: `شماره پیش‌فاکتور «${newProforma}» تکراری است.` });
+        res.status(409).json({ error: dup.message, duplicate: dup });
         return;
       }
     }
@@ -1525,7 +1744,7 @@ export function createApiRouter(): express.Router {
     }
 
     const fresh = hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order.id) as Record<string, unknown>);
-    syncOrderToSupabase(req.supabase, fresh).catch(() => {});
+    syncOrderToSupabase(req.supabase, fresh).catch(logMirrorError('order', fresh.id));
     broadcastChange('orders');
     res.json({ order: fresh });
   });
@@ -1708,7 +1927,7 @@ export function createApiRouter(): express.Router {
 
     tx();
     const fresh = hydrateCheckRow(db.prepare(`SELECT * FROM checks WHERE id = ?`).get(checkId) as Record<string, unknown>);
-    await syncCheckToSupabase(req.supabase, fresh).catch(() => {});
+    await syncCheckToSupabase(req.supabase, fresh).catch(logMirrorError('check', fresh.id));
     broadcastChange('checks');
     res.status(201).json({ check: fresh });
   });
@@ -1772,7 +1991,7 @@ export function createApiRouter(): express.Router {
 
     try {
       const fresh = tx();
-      await syncCheckToSupabase(req.supabase, fresh).catch(() => {});
+      await syncCheckToSupabase(req.supabase, fresh).catch(logMirrorError('check', fresh.id));
       broadcastChange('checks');
       res.json({ check: fresh });
     } catch (e) {
@@ -1827,7 +2046,7 @@ export function createApiRouter(): express.Router {
     }
 
     const fresh = hydrateCheckRow(db.prepare(`SELECT * FROM checks WHERE id = ?`).get(checkId) as Record<string, unknown>);
-    await syncCheckToSupabase(req.supabase, fresh).catch(() => {});
+    await syncCheckToSupabase(req.supabase, fresh).catch(logMirrorError('check', fresh.id));
     addAuditLog(
       user.id,
       user.displayName,
@@ -1921,7 +2140,7 @@ export function createApiRouter(): express.Router {
 
     tx();
     const fresh = hydrateCheckRow(db.prepare(`SELECT * FROM checks WHERE id = ?`).get(checkId) as Record<string, unknown>);
-    await syncCheckToSupabase(req.supabase, fresh).catch(() => {});
+    await syncCheckToSupabase(req.supabase, fresh).catch(logMirrorError('check', fresh.id));
     broadcastChange('checks');
     res.json({ check: fresh });
   });
@@ -1969,7 +2188,7 @@ export function createApiRouter(): express.Router {
 
     addAuditLog(user.id, user.displayName, 'procurement', `درخواست تامین جدید ثبت شد: ${partName} (${brand}) به تعداد ${qtyNeeded} عدد.`);
     const fresh = hydrateProcurementRow(db.prepare(`SELECT * FROM procurement_items WHERE id = ?`).get(id) as Record<string, unknown>);
-    await syncProcurementToSupabase(req.supabase, fresh).catch(() => {});
+    await syncProcurementToSupabase(req.supabase, fresh).catch(logMirrorError('procurement item', fresh.id));
     broadcastChange('procurement');
     res.status(201).json({ item: fresh });
   });
@@ -2001,7 +2220,7 @@ export function createApiRouter(): express.Router {
     const statusLabel = status === 'ordered' ? 'در حال سفارش به تامین‌کننده' : status === 'received' ? 'تامین و وارد انبار شد' : 'ثبت کسری';
     addAuditLog(user.id, user.displayName, 'procurement', `وضعیت تامین قطعه «${String(existing.part_name)}» به «${statusLabel}» تغییر یافت.`);
     const fresh = hydrateProcurementRow(db.prepare(`SELECT * FROM procurement_items WHERE id = ?`).get(id) as Record<string, unknown>);
-    await syncProcurementToSupabase(req.supabase, fresh).catch(() => {});
+    await syncProcurementToSupabase(req.supabase, fresh).catch(logMirrorError('procurement item', fresh.id));
     broadcastChange('procurement');
     res.json({ item: fresh });
   });
@@ -2012,10 +2231,21 @@ export function createApiRouter(): express.Router {
     const limit = Math.min(100, Math.max(10, Number(req.query.limit || 30)));
     const offset = (page - 1) * limit;
 
-    const total = (db.prepare(`SELECT COUNT(*) as cnt FROM audit_logs`).get() as { cnt: number }).cnt;
+    // Audit messages contain customer names and amounts across all reps. Only supervisory roles
+    // (CEO, sales manager, accounting) see the full log; everyone else sees only their own actions.
+    const logUser = req.user!;
+    const seesAllLogs = logUser.id === 'ceo' || logUser.id === 'sales_mgr' || logUser.id === 'accounting';
+    const whereClause = seesAllLogs ? '' : 'WHERE actor_id = ?';
+    const whereArgs: unknown[] = seesAllLogs ? [] : [logUser.id];
+
+    const total = (
+      db.prepare(`SELECT COUNT(*) as cnt FROM audit_logs ${whereClause}`).get(...whereArgs) as { cnt: number }
+    ).cnt;
     const rows = db
-      .prepare(`SELECT id, actor_id, actor_name, category, message, created_at FROM audit_logs ORDER BY id DESC LIMIT ? OFFSET ?`)
-      .all(limit, offset) as Array<{
+      .prepare(
+        `SELECT id, actor_id, actor_name, category, message, created_at FROM audit_logs ${whereClause} ORDER BY id DESC LIMIT ? OFFSET ?`,
+      )
+      .all(...whereArgs, limit, offset) as Array<{
         id: number;
         actor_id: string;
         actor_name: string;
@@ -2133,6 +2363,7 @@ export function createApiRouter(): express.Router {
     }
 
     broadcastChange('settings');
+    void mirrorUsersAndSettingsToSupabase();
     res.json({
       waPhone: getSetting('wa_phone'),
       roles: listPublicRoles(),

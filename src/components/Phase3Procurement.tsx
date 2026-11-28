@@ -34,7 +34,8 @@ export function Phase3Procurement({ refreshTrigger, onNotify, onDataChanged }: P
 
   const mergeItemLocal = useCallback((updated: ProcurementItem) => {
     setItems((prev) => mergeIncrementalRecords(prev, [updated]));
-    lastSyncCursorRef.current = computeLatestCursor([updated.updatedAt], lastSyncCursorRef.current);
+    // Do not advance the sync cursor from a local action: other users' changes with earlier
+    // timestamps may not have been fetched yet and would otherwise be skipped forever.
   }, []);
 
   const fetchItems = useCallback(async () => {

@@ -167,6 +167,9 @@ export interface IncrementalSyncResponse {
   orders: OrderRecord[];
   checks: CheckRecord[];
   procurement: ProcurementItem[];
+  /** Records that changed since the cursor but are no longer visible to the caller's role. */
+  removedOrderIds?: string[];
+  removedCheckIds?: string[];
 }
 
 export const ROLE_DEFINITIONS: RoleDefinition[] = [
@@ -286,3 +289,32 @@ export const TOP_BRANDS: string[] = [
   'ماندگار پارت',
   'سایر برندهای ۵۰گانه',
 ];
+
+// ==================== Invoice auto-fill & duplicate detection ====================
+export interface DuplicateInvoiceInfo {
+  orderId: string;
+  number: string;
+  registeredBy: string;
+  registeredAt: string;
+  message: string;
+}
+
+export type InvoiceFieldKey = 'proforma' | 'amountToman' | 'items' | 'customer';
+
+export interface InvoiceExtractionResultDto {
+  ok: boolean;
+  invoiceNumber?: string | null;
+  invoiceDate?: string | null;
+  buyerCode?: string | null;
+  grandTotalRial?: number | null;
+  amountToman?: number | null;
+  itemsText?: string;
+  warnings?: Partial<Record<InvoiceFieldKey, string>>;
+  error?: string;
+}
+
+export interface InvoiceExtractionResponse {
+  result: InvoiceExtractionResultDto;
+  customerName?: string | null;
+  duplicate?: DuplicateInvoiceInfo | null;
+}

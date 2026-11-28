@@ -43,12 +43,45 @@ export async function syncFileMetadataToSupabase(
       owner_record_id: ownerRecordId,
       uploaded_by: uploadedBy,
     },
-    { onConflict: 'id' },
+    { onConflict: 'id', ignoreDuplicates: true },
   );
   if (error) {
     console.error('[Supabase RLS] File metadata sync error:', error.message);
     throw new Error('دسترسی یا همگام‌سازی متادیتای فایل در دیتابیس سوپابیس با خطا مواجه شد.');
   }
+}
+
+/**
+ * Mirrors the SQLite "file is now attached to record X" link into the Supabase `files` table.
+ * Only rows still unlinked (owner_record_id IS NULL) are updated, so links are never re-pointed.
+ */
+export async function linkFilesToRecordInSupabase(
+  supabase: SupabaseClient | null | undefined,
+  fileIds: string[],
+  ownerKind: 'order_doc' | 'signature' | 'check_attachment',
+  ownerRecordId: string,
+): Promise<void> {
+  if (!supabase) return;
+  const ids = Array.from(new Set(fileIds.filter(Boolean)));
+  if (ids.length === 0) return;
+  const { error } = await supabase
+    .from('files')
+    .update({ owner_kind: ownerKind, owner_record_id: ownerRecordId })
+    .in('id', ids)
+    .is('owner_record_id', null);
+  if (error) {
+    console.error(`[Supabase RLS] File link sync error (${ownerKind} ${ownerRecordId}):`, error.message);
+  }
+}
+
+/** Logs a failed Supabase mirror write instead of silently swallowing it. SQLite stays authoritative. */
+export function logMirrorError(kind: string, recordId: string) {
+  return (err: unknown): void => {
+    console.error(
+      `[Supabase mirror] Failed to mirror ${kind} ${recordId}:`,
+      err instanceof Error ? err.message : err,
+    );
+  };
 }
 
 export async function syncOrderToSupabase(
@@ -97,7 +130,7 @@ export async function syncOrderToSupabase(
   }
 
   for (const doc of order.documents) {
-    await supabase.from('order_documents').upsert(
+    const { error: docErr } = await supabase.from('order_documents').upsert(
       {
         id: doc.id,
         order_id: doc.orderId,
@@ -110,8 +143,16 @@ export async function syncOrderToSupabase(
         uploaded_by: doc.uploadedBy,
         created_at: doc.createdAt,
       },
-      { onConflict: 'id' },
+      { onConflict: 'id', ignoreDuplicates: true },
     );
+    if (docErr) {
+      console.error(`[Supabase RLS] Order document sync error (order ${order.id}, doc ${doc.id}):`, docErr.message);
+    }
+  }
+
+  await linkFilesToRecordInSupabase(supabase, order.documents.map((d) => d.fileId), 'order_doc', order.id);
+  if (order.signatureFileId) {
+    await linkFilesToRecordInSupabase(supabase, [order.signatureFileId], 'signature', order.id);
   }
 }
 
@@ -152,7 +193,7 @@ export async function syncCheckToSupabase(
   }
 
   for (const att of check.attachments) {
-    await supabase.from('check_attachments').upsert(
+    const { error: attErr } = await supabase.from('check_attachments').upsert(
       {
         id: att.id,
         check_id: att.checkId,
@@ -162,9 +203,14 @@ export async function syncCheckToSupabase(
         mime_type: att.mimeType,
         created_at: att.createdAt,
       },
-      { onConflict: 'id' },
+      { onConflict: 'id', ignoreDuplicates: true },
     );
+    if (attErr) {
+      console.error(`[Supabase RLS] Check attachment sync error (check ${check.id}, attachment ${att.id}):`, attErr.message);
+    }
   }
+
+  await linkFilesToRecordInSupabase(supabase, check.attachments.map((a) => a.fileId), 'check_attachment', check.id);
 }
 
 export async function syncProcurementToSupabase(
