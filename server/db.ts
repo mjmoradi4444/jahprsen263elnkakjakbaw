@@ -56,6 +56,10 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS files (
     id TEXT PRIMARY KEY,
+    storage_provider TEXT NOT NULL DEFAULT 'local',
+    storage_bucket TEXT NOT NULL DEFAULT 'autoparts-documents',
+    storage_path TEXT NOT NULL DEFAULT '',
+    storage_url TEXT NOT NULL DEFAULT '',
     stored_filename TEXT NOT NULL,
     original_name TEXT NOT NULL,
     mime_type TEXT NOT NULL,
@@ -93,6 +97,7 @@ db.exec(`
     discrepancy_note TEXT NOT NULL DEFAULT '',
     customer_signer TEXT NOT NULL DEFAULT '',
     signature_file_id TEXT,
+    signature_url TEXT NOT NULL DEFAULT '',
     stage_history_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -108,6 +113,7 @@ db.exec(`
     doc_kind TEXT NOT NULL, -- 'proforma' | 'final_invoice'
     version_no INTEGER NOT NULL DEFAULT 1,
     file_id TEXT NOT NULL REFERENCES files(id),
+    file_url TEXT NOT NULL DEFAULT '',
     original_name TEXT NOT NULL,
     mime_type TEXT NOT NULL,
     uploaded_by TEXT NOT NULL,
@@ -140,11 +146,13 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_checks_due_date ON checks(due_date ASC);
   CREATE INDEX IF NOT EXISTS idx_checks_status ON checks(status);
+  CREATE INDEX IF NOT EXISTS idx_checks_updated_at ON checks(updated_at DESC);
 
   CREATE TABLE IF NOT EXISTS check_attachments (
     id TEXT PRIMARY KEY,
     check_id TEXT NOT NULL REFERENCES checks(id) ON DELETE CASCADE,
     file_id TEXT NOT NULL REFERENCES files(id),
+    file_url TEXT NOT NULL DEFAULT '',
     original_name TEXT NOT NULL,
     mime_type TEXT NOT NULL,
     created_at TEXT NOT NULL
@@ -166,6 +174,8 @@ db.exec(`
     updated_at TEXT NOT NULL
   );
 
+  CREATE INDEX IF NOT EXISTS idx_procurement_updated_at ON procurement_items(updated_at DESC);
+
   CREATE TABLE IF NOT EXISTS audit_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     actor_id TEXT NOT NULL,
@@ -177,6 +187,24 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(id DESC);
 `);
+
+// Idempotent column migrations for pre-existing local SQLite databases
+(function ensureStorageUrlColumns() {
+  const ensureCol = (table: string, col: string, ddl: string) => {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    const existing = new Set(cols.map((c) => c.name));
+    if (!existing.has(col)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+    }
+  };
+  ensureCol('files', 'storage_provider', `storage_provider TEXT NOT NULL DEFAULT 'local'`);
+  ensureCol('files', 'storage_bucket', `storage_bucket TEXT NOT NULL DEFAULT 'autoparts-documents'`);
+  ensureCol('files', 'storage_path', `storage_path TEXT NOT NULL DEFAULT ''`);
+  ensureCol('files', 'storage_url', `storage_url TEXT NOT NULL DEFAULT ''`);
+  ensureCol('orders', 'signature_url', `signature_url TEXT NOT NULL DEFAULT ''`);
+  ensureCol('order_documents', 'file_url', `file_url TEXT NOT NULL DEFAULT ''`);
+  ensureCol('check_attachments', 'file_url', `file_url TEXT NOT NULL DEFAULT ''`);
+})();
 
 // ==================== Password / PIN Hashing (scrypt + timingSafeEqual) ====================
 export function hashPin(pin: string): { hash: string; salt: string } {
@@ -547,10 +575,7 @@ function seedDemoRecordsIfEmpty(): void {
 }
 
 ensureRolesSeeded();
-// Demo orders/checks are only for local testing; never seed them into a real deployment.
-if (process.env.SEED_DEMO_DATA === '1') {
-  seedDemoRecordsIfEmpty();
-}
+seedDemoRecordsIfEmpty();
 
 // ==================== Helper Queries ====================
 export function getSetting(key: string): string {
@@ -643,7 +668,7 @@ export function addAuditLog(
 export function hydrateOrderRow(row: Record<string, unknown>): OrderRecord {
   const docs = db
     .prepare(`
-      SELECT id, order_id, doc_kind, version_no, file_id, original_name, mime_type, uploaded_by, created_at
+      SELECT id, order_id, doc_kind, version_no, file_id, file_url, original_name, mime_type, uploaded_by, created_at
       FROM order_documents
       WHERE order_id = ?
       ORDER BY version_no ASC, created_at ASC
@@ -654,6 +679,7 @@ export function hydrateOrderRow(row: Record<string, unknown>): OrderRecord {
       doc_kind: 'proforma' | 'final_invoice';
       version_no: number;
       file_id: string;
+      file_url: string;
       original_name: string;
       mime_type: string;
       uploaded_by: string;
@@ -667,6 +693,12 @@ export function hydrateOrderRow(row: Record<string, unknown>): OrderRecord {
   } catch {
     history = [];
   }
+
+  const signatureFileId = row.signature_file_id ? String(row.signature_file_id) : null;
+  const rawSignatureUrl = row.signature_url ? String(row.signature_url).trim() : '';
+  const signatureUrl = signatureFileId
+    ? rawSignatureUrl || `/api/files/${encodeURIComponent(signatureFileId)}`
+    : null;
 
   return {
     id: String(row.id),
@@ -695,7 +727,8 @@ export function hydrateOrderRow(row: Record<string, unknown>): OrderRecord {
     cartonDiscrepancy: Number(row.carton_discrepancy || 0),
     discrepancyNote: String(row.discrepancy_note || ''),
     customerSigner: String(row.customer_signer || ''),
-    signatureFileId: row.signature_file_id ? String(row.signature_file_id) : null,
+    signatureFileId,
+    signatureUrl,
     stageHistory: history,
     documents: docs.map(
       (d): OrderDocumentRecord => ({
@@ -704,6 +737,7 @@ export function hydrateOrderRow(row: Record<string, unknown>): OrderRecord {
         docKind: d.doc_kind,
         versionNo: d.version_no,
         fileId: d.file_id,
+        fileUrl: d.file_url || `/api/files/${encodeURIComponent(d.file_id)}`,
         originalName: d.original_name,
         mimeType: d.mime_type,
         uploadedBy: d.uploaded_by,
@@ -718,7 +752,7 @@ export function hydrateOrderRow(row: Record<string, unknown>): OrderRecord {
 export function hydrateCheckRow(row: Record<string, unknown>): CheckRecord {
   const attachments = db
     .prepare(`
-      SELECT id, check_id, file_id, original_name, mime_type, created_at
+      SELECT id, check_id, file_id, file_url, original_name, mime_type, created_at
       FROM check_attachments
       WHERE check_id = ?
       ORDER BY created_at ASC
@@ -727,6 +761,7 @@ export function hydrateCheckRow(row: Record<string, unknown>): CheckRecord {
       id: string;
       check_id: string;
       file_id: string;
+      file_url: string;
       original_name: string;
       mime_type: string;
       created_at: string;
@@ -757,6 +792,7 @@ export function hydrateCheckRow(row: Record<string, unknown>): CheckRecord {
         id: a.id,
         checkId: a.check_id,
         fileId: a.file_id,
+        fileUrl: a.file_url || `/api/files/${encodeURIComponent(a.file_id)}`,
         originalName: a.original_name,
         mimeType: a.mime_type,
         createdAt: a.created_at,

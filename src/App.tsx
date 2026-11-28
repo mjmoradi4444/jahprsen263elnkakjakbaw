@@ -307,6 +307,7 @@ export default function App() {
           {activePhase === 1 && (
             <Phase1Orders
               user={user}
+              roles={roles}
               refreshTrigger={refreshTrigger}
               onNotify={showToast}
               onDataChanged={() => setRefreshTrigger((n) => n + 1)}

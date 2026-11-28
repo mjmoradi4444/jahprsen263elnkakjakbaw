@@ -1,11 +1,13 @@
 import {
   AuditLogEntry,
   CheckRecord,
+  IncrementalSyncResponse,
   OrderRecord,
   ProcurementItem,
   ProcurementStatus,
   UserAccountPublic,
 } from '../shared/types';
+import { isDirectSupabasePublicUrl, isSafeStorageResourceUrl } from '../shared/sync';
 
 // Strictly in-memory session token — NEVER written to localStorage or sessionStorage
 let inMemoryToken: string | null = null;
@@ -79,6 +81,7 @@ export interface OrdersListResponse {
     delivered: number;
     totalAmountToman: number;
   }>;
+  syncCursor?: string;
 }
 
 export interface ChecksListResponse {
@@ -101,6 +104,7 @@ export interface ChecksListResponse {
     returned: number;
     finalizedAmountToman: number;
   }>;
+  syncCursor?: string;
 }
 
 export interface LogsListResponse {
@@ -128,29 +132,109 @@ export const api = {
   logout: () => apiRequest<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
   me: () => apiRequest<{ user: UserAccountPublic; roles: UserAccountPublic[] }>('/api/auth/me'),
 
+  syncChanges: (since?: string | null) => {
+    const sp = new URLSearchParams();
+    if (since) sp.set('since', since);
+    const qs = sp.toString();
+    return apiRequest<IncrementalSyncResponse>(qs ? `/api/sync?${qs}` : '/api/sync');
+  },
+
   uploadFile: async (file: File, kind: 'order_doc' | 'check_attachment' | 'signature') => {
     const fd = new FormData();
     fd.append('file', file);
     fd.append('kind', kind);
-    return apiRequest<{ fileId: string; mimeType: string; originalName: string }>('/api/files', {
+    return apiRequest<{
+      fileId: string;
+      fileUrl: string;
+      storageUrl: string;
+      storageProvider: string;
+      mimeType: string;
+      originalName: string;
+    }>('/api/files', {
       method: 'POST',
       body: fd,
     });
   },
 
-  fetchFileBlobUrl: async (fileId: string): Promise<{ blobUrl: string; mimeType: string }> => {
+  /**
+   * Resolves a verified display URL for a PDF, check photo, or signature stored in Supabase Storage.
+   * 1. If the DB record already holds a verified Supabase Storage public URL (`/storage/v1/object/public/...`),
+   *    returns it directly with zero extra server round-trip.
+   * 2. Otherwise requests a short-lived RBAC-gated URL from `POST /api/files/:id/signed-url`
+   *    (returns Supabase signed/public HTTPS URL directly when Supabase Storage is configured).
+   * 3. Falls back to authenticated `/api/files/:id` proxy stream returning a revocable Blob URL.
+   */
+  resolveFileDisplayUrl: async (
+    fileId: string,
+    fileUrl?: string | null,
+    mimeTypeHint?: string | null,
+  ): Promise<{ url: string; mimeType: string; revoke: boolean }> => {
+    if (fileUrl && isDirectSupabasePublicUrl(fileUrl)) {
+      return {
+        url: fileUrl,
+        mimeType: mimeTypeHint || 'application/octet-stream',
+        revoke: false,
+      };
+    }
+
+    const signedInfo = await apiRequest<{
+      url: string;
+      accessMode?: 'public_url' | 'signed_url' | 'proxy';
+      mimeType: string;
+      originalName: string;
+      storageProvider: string;
+      expiresInSeconds: number | null;
+    }>(`/api/files/${encodeURIComponent(fileId)}/signed-url`, { method: 'POST' });
+
+    if (
+      signedInfo.storageProvider === 'supabase' &&
+      signedInfo.url.startsWith('https://') &&
+      isSafeStorageResourceUrl(signedInfo.url)
+    ) {
+      return {
+        url: signedInfo.url,
+        mimeType: signedInfo.mimeType || mimeTypeHint || 'application/octet-stream',
+        revoke: false,
+      };
+    }
+
+    const proxyPath = isSafeStorageResourceUrl(signedInfo.url)
+      ? signedInfo.url
+      : `/api/files/${encodeURIComponent(fileId)}`;
+
     const headers = new Headers();
     if (inMemoryToken) headers.set('Authorization', `Bearer ${inMemoryToken}`);
-    const res = await fetch(`/api/files/${encodeURIComponent(fileId)}`, { headers });
+    const res = await fetch(proxyPath, { headers });
     if (!res.ok) {
-      throw new ApiError(res.status, 'عدم دسترسی یا خطا در دریافت فایل از سرور');
+      throw new ApiError(res.status, 'عدم دسترسی یا خطا در دریافت فایل از مخزن ذخیره‌سازی');
     }
     const blob = await res.blob();
-    return { blobUrl: URL.createObjectURL(blob), mimeType: blob.type };
+    return {
+      url: URL.createObjectURL(blob),
+      mimeType: blob.type || signedInfo.mimeType || mimeTypeHint || 'application/octet-stream',
+      revoke: true,
+    };
   },
 
-  downloadFile: async (fileId: string, filename: string): Promise<void> => {
-    const { blobUrl } = await api.fetchFileBlobUrl(fileId);
+  fetchFileBlobUrl: async (
+    fileId: string,
+    fileUrl?: string | null,
+    mimeTypeHint?: string | null,
+  ): Promise<{ blobUrl: string; mimeType: string }> => {
+    const resolved = await api.resolveFileDisplayUrl(fileId, fileUrl, mimeTypeHint);
+    if (resolved.revoke) {
+      return { blobUrl: resolved.url, mimeType: resolved.mimeType };
+    }
+    const res = await fetch(resolved.url);
+    if (!res.ok) {
+      throw new ApiError(res.status, 'خطا در دریافت فایل از Supabase Storage');
+    }
+    const blob = await res.blob();
+    return { blobUrl: URL.createObjectURL(blob), mimeType: blob.type || resolved.mimeType };
+  },
+
+  downloadFile: async (fileId: string, filename: string, fileUrl?: string | null): Promise<void> => {
+    const { blobUrl } = await api.fetchFileBlobUrl(fileId, fileUrl);
     const a = document.createElement('a');
     a.href = blobUrl;
     a.download = filename || 'document';
@@ -160,13 +244,21 @@ export const api = {
     setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
   },
 
-  getOrders: (params: { filter?: string; stage?: number | null; search?: string; page?: number; limit?: number }) => {
+  getOrders: (params: {
+    filter?: string;
+    stage?: number | null;
+    search?: string;
+    page?: number;
+    limit?: number;
+    since?: string | null;
+  }) => {
     const sp = new URLSearchParams();
     if (params.filter) sp.set('filter', params.filter);
     if (params.stage !== null && params.stage !== undefined) sp.set('stage', String(params.stage));
     if (params.search) sp.set('search', params.search);
     if (params.page) sp.set('page', String(params.page));
     if (params.limit) sp.set('limit', String(params.limit));
+    if (params.since) sp.set('since', params.since);
     return apiRequest<OrdersListResponse>(`/api/orders?${sp.toString()}`);
   },
 
@@ -224,7 +316,7 @@ export const api = {
       cartonsDelivered: number;
       customerSigner: string;
       discrepancyNote: string;
-      signaturePngBase64: string;
+      signatureFileId: string;
     },
   ) =>
     apiRequest<{ order: OrderRecord }>(`/api/orders/${encodeURIComponent(id)}/driver-delivery`, {
@@ -310,7 +402,14 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  getProcurement: () => apiRequest<{ items: ProcurementItem[] }>('/api/procurement'),
+  getProcurement: (since?: string | null) => {
+    const sp = new URLSearchParams();
+    if (since) sp.set('since', since);
+    const qs = sp.toString();
+    return apiRequest<{ items: ProcurementItem[]; syncCursor?: string }>(
+      qs ? `/api/procurement?${qs}` : '/api/procurement',
+    );
+  },
   createProcurement: (payload: {
     brand: string;
     partName: string;

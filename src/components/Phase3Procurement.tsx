@@ -1,6 +1,7 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { PackagePlus, Plus } from 'lucide-react';
 import { api, ApiError } from '../api/client';
+import { computeLatestCursor, mergeIncrementalRecords } from '../shared/sync';
 import { ProcurementItem, ProcurementStatus, TOP_BRANDS } from '../shared/types';
 import { formatPersianDateTime, normalizeDigits } from '../shared/workflow';
 
@@ -27,10 +28,26 @@ export function Phase3Procurement({ refreshTrigger, onNotify, onDataChanged }: P
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const lastSyncCursorRef = useRef<string | null>(null);
+  const inFlightSyncRef = useRef(false);
+  const initialRefreshRef = useRef(refreshTrigger);
+
+  const mergeItemLocal = useCallback((updated: ProcurementItem) => {
+    setItems((prev) => mergeIncrementalRecords(prev, [updated]));
+    lastSyncCursorRef.current = computeLatestCursor([updated.updatedAt], lastSyncCursorRef.current);
+  }, []);
+
   const fetchItems = useCallback(async () => {
     try {
-      const res = await api.getProcurement();
-      setItems(res.items);
+      const snapshot = await api.syncChanges(null);
+      setItems(snapshot.procurement);
+      lastSyncCursorRef.current =
+        snapshot.cursor ||
+        computeLatestCursor(
+          snapshot.procurement.map((i) => i.updatedAt),
+          lastSyncCursorRef.current,
+        ) ||
+        new Date().toISOString();
     } catch (err) {
       onNotify(err instanceof ApiError ? err.message : 'خطا در دریافت صف تامین.', true);
     } finally {
@@ -38,9 +55,45 @@ export function Phase3Procurement({ refreshTrigger, onNotify, onDataChanged }: P
     }
   }, [onNotify]);
 
+  const runIncrementalSync = useCallback(async () => {
+    if (inFlightSyncRef.current) return;
+    if (!lastSyncCursorRef.current) {
+      await fetchItems();
+      return;
+    }
+    inFlightSyncRef.current = true;
+    try {
+      const delta = await api.syncChanges(lastSyncCursorRef.current);
+      lastSyncCursorRef.current = delta.cursor;
+      if (delta.procurement.length > 0) {
+        setItems((prev) => mergeIncrementalRecords(prev, delta.procurement));
+      }
+    } catch {
+      // ignore transient errors
+    } finally {
+      inFlightSyncRef.current = false;
+    }
+  }, [fetchItems]);
+
   useEffect(() => {
     fetchItems();
-  }, [fetchItems, refreshTrigger]);
+  }, [fetchItems]);
+
+  useEffect(() => {
+    if (refreshTrigger === initialRefreshRef.current) return;
+    initialRefreshRef.current = refreshTrigger;
+    runIncrementalSync();
+  }, [refreshTrigger, runIncrementalSync]);
+
+  // Lightweight 4.5s incremental sync (`updated_at > cursor`) — zero unchanged rows downloaded
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        runIncrementalSync();
+      }
+    }, 4_500);
+    return () => clearInterval(timer);
+  }, [runIncrementalSync]);
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
@@ -62,6 +115,7 @@ export function Phase3Procurement({ refreshTrigger, onNotify, onDataChanged }: P
         relatedOrderProforma: relatedProforma.trim(),
         supplierNote: supplierNote.trim(),
       });
+      mergeItemLocal(res.item);
       setPartName('');
       setPartCode('');
       setQtyNeeded('10');
@@ -70,7 +124,6 @@ export function Phase3Procurement({ refreshTrigger, onNotify, onDataChanged }: P
       setShowForm(false);
       onNotify(`کسری قطعه «${res.item.partName}» در صف تامین ثبت شد.`);
       onDataChanged();
-      await fetchItems();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'خطا در ثبت درخواست تامین.');
     } finally {
@@ -81,16 +134,17 @@ export function Phase3Procurement({ refreshTrigger, onNotify, onDataChanged }: P
   async function handleTransition(item: ProcurementItem, nextStatus: ProcurementStatus) {
     setBusyId(item.id);
     try {
-      await api.updateProcurement(item.id, { status: nextStatus });
+      const res = await api.updateProcurement(item.id, { status: nextStatus });
+      mergeItemLocal(res.item);
       onNotify(
         nextStatus === 'ordered'
           ? `سفارش تامین «${item.partName}» به تامین‌کننده ثبت شد.`
           : `ورود قطعه «${item.partName}» به انبار تایید شد.`,
       );
       onDataChanged();
-      await fetchItems();
     } catch (err) {
       onNotify(err instanceof ApiError ? err.message : 'خطا در تغییر وضعیت تامین.', true);
+      await runIncrementalSync();
     } finally {
       setBusyId(null);
     }

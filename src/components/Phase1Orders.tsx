@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Check,
@@ -13,7 +13,8 @@ import {
   Search,
   Upload,
 } from 'lucide-react';
-import { api, ApiError, LogsListResponse, OrdersListResponse, WhatsAppSummaryResponse } from '../api/client';
+import { api, ApiError, LogsListResponse, WhatsAppSummaryResponse } from '../api/client';
+import { buildOrdersViewState, computeLatestCursor, mergeIncrementalRecords } from '../shared/sync';
 import { OrderRecord, STAGES, UserAccountPublic } from '../shared/types';
 import {
   canRoleActOnOrder,
@@ -32,19 +33,20 @@ import {
 
 interface Phase1OrdersProps {
   user: UserAccountPublic;
+  roles: UserAccountPublic[];
   refreshTrigger: number;
   onNotify: (message: string, isError?: boolean) => void;
   onDataChanged: () => void;
 }
 
-export function Phase1Orders({ user, refreshTrigger, onNotify, onDataChanged }: Phase1OrdersProps) {
+export function Phase1Orders({ user, roles, refreshTrigger, onNotify, onDataChanged }: Phase1OrdersProps) {
   const [subTab, setSubTab] = useState<'board' | 'new' | 'logs'>('board');
   const [filter, setFilter] = useState<string>(user.id === 'ceo' ? 'active' : 'mine');
   const [selectedStage, setSelectedStage] = useState<number | null>(null);
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
 
-  const [data, setData] = useState<OrdersListResponse | null>(null);
+  const [allOrders, setAllOrders] = useState<OrderRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busyOrderId, setBusyOrderId] = useState<string | null>(null);
@@ -78,27 +80,88 @@ export function Phase1Orders({ user, refreshTrigger, onNotify, onDataChanged }: 
   const [waSummary, setWaSummary] = useState<WhatsAppSummaryResponse | null>(null);
   const [copiedWa, setCopiedWa] = useState(false);
 
-  const fetchOrders = useCallback(async () => {
+  const lastSyncCursorRef = useRef<string | null>(null);
+  const inFlightSyncRef = useRef(false);
+  const initialRefreshRef = useRef(refreshTrigger);
+
+  const mergeOrderLocal = useCallback((updatedOrder: OrderRecord) => {
+    setAllOrders((prev) => mergeIncrementalRecords(prev, [updatedOrder]));
+    lastSyncCursorRef.current = computeLatestCursor([updatedOrder.updatedAt], lastSyncCursorRef.current);
+  }, []);
+
+  // Initial full role-scoped snapshot loaded ONCE (subsequent updates transfer ONLY `updated_at > cursor`)
+  const loadInitialOrders = useCallback(async () => {
     setLoadError(null);
+    setLoading(true);
     try {
-      const res = await api.getOrders({
-        filter,
-        stage: selectedStage,
-        search: search.trim(),
-        page,
-        limit: 12,
-      });
-      setData(res);
+      const snapshot = await api.syncChanges(null);
+      setAllOrders(snapshot.orders);
+      lastSyncCursorRef.current =
+        snapshot.cursor ||
+        computeLatestCursor(
+          snapshot.orders.map((o) => o.updatedAt),
+          null,
+        );
     } catch (err) {
       setLoadError(err instanceof ApiError ? err.message : 'خطا در دریافت لیست سفارش‌ها.');
     } finally {
       setLoading(false);
     }
-  }, [filter, selectedStage, search, page]);
+  }, []);
+
+  // True incremental delta sync (`updated_at > since`) — never re-downloads unchanged orders!
+  const runIncrementalSync = useCallback(async () => {
+    if (inFlightSyncRef.current) return;
+    if (!lastSyncCursorRef.current) {
+      await loadInitialOrders();
+      return;
+    }
+    inFlightSyncRef.current = true;
+    try {
+      const delta = await api.syncChanges(lastSyncCursorRef.current);
+      lastSyncCursorRef.current = delta.cursor;
+      if (delta.orders.length > 0) {
+        setAllOrders((prev) => mergeIncrementalRecords(prev, delta.orders));
+      }
+    } catch {
+      // Silently ignore transient incremental check failures; next tick or SSE ping retries
+    } finally {
+      inFlightSyncRef.current = false;
+    }
+  }, [loadInitialOrders]);
 
   useEffect(() => {
-    fetchOrders();
-  }, [fetchOrders, refreshTrigger]);
+    lastSyncCursorRef.current = null;
+    loadInitialOrders();
+  }, [user.id, loadInitialOrders]);
+
+  useEffect(() => {
+    if (refreshTrigger === initialRefreshRef.current) return;
+    initialRefreshRef.current = refreshTrigger;
+    runIncrementalSync();
+  }, [refreshTrigger, runIncrementalSync]);
+
+  // Lightweight 4.5s incremental sync (fetches ONLY rows with `updated_at > cursor`, zero unchanged rows)
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        runIncrementalSync();
+      }
+    }, 4_500);
+    return () => clearInterval(timer);
+  }, [runIncrementalSync]);
+
+  const data = useMemo(
+    () =>
+      buildOrdersViewState(allOrders, user, roles, {
+        filter,
+        stage: selectedStage,
+        search,
+        page,
+        limit: 12,
+      }),
+    [allOrders, user, roles, filter, selectedStage, search, page],
+  );
 
   useEffect(() => {
     if (subTab !== 'logs') return;
@@ -115,17 +178,17 @@ export function Phase1Orders({ user, refreshTrigger, onNotify, onDataChanged }: 
   async function handleAdvance(order: OrderRecord) {
     setBusyOrderId(order.id);
     try {
-      await api.advanceOrder(order.id, order.version);
+      const res = await api.advanceOrder(order.id, order.version);
+      mergeOrderLocal(res.order);
       onNotify(
         order.stage === 2
           ? `پیش‌فاکتور ${order.proforma} تایید و جهت تاییدیه مشتری ارسال شد.`
           : `تاییدیه مشتری برای ${order.proforma} ثبت و به حسابداری ارسال شد.`,
       );
       onDataChanged();
-      await fetchOrders();
     } catch (err) {
       onNotify(err instanceof ApiError ? err.message : 'خطا در بروزرسانی مرحله.', true);
-      await fetchOrders();
+      await runIncrementalSync();
     } finally {
       setBusyOrderId(null);
     }
@@ -134,13 +197,13 @@ export function Phase1Orders({ user, refreshTrigger, onNotify, onDataChanged }: 
   async function handleMgrResolve(order: OrderRecord) {
     setBusyOrderId(order.id);
     try {
-      await api.mgrResolveOrder(order.id, order.version);
+      const res = await api.mgrResolveOrder(order.id, order.version);
+      mergeOrderLocal(res.order);
       onNotify(`مغایرت پیش‌فاکتور ${order.proforma} بررسی و مجدداً به حسابداری ارسال شد.`);
       onDataChanged();
-      await fetchOrders();
     } catch (err) {
       onNotify(err instanceof ApiError ? err.message : 'خطا در ارسال مجدد.', true);
-      await fetchOrders();
+      await runIncrementalSync();
     } finally {
       setBusyOrderId(null);
     }
@@ -185,6 +248,7 @@ export function Phase1Orders({ user, refreshTrigger, onNotify, onDataChanged }: 
         items: fItems.trim(),
         fileId: fUploadedFile?.fileId || null,
       });
+      mergeOrderLocal(res.order);
       setFCustomer('');
       setFProforma('');
       setFAmount('');
@@ -196,7 +260,6 @@ export function Phase1Orders({ user, refreshTrigger, onNotify, onDataChanged }: 
       setSelectedStage(null);
       setPage(1);
       onDataChanged();
-      await fetchOrders();
     } catch (err) {
       setFError(err instanceof ApiError ? err.message : 'خطا در ثبت پیش‌فاکتور.');
     } finally {
@@ -469,7 +532,7 @@ export function Phase1Orders({ user, refreshTrigger, onNotify, onDataChanged }: 
               <span>{loadError}</span>
               <button
                 type="button"
-                onClick={fetchOrders}
+                onClick={loadInitialOrders}
                 className="px-3 py-1.5 rounded-lg bg-red-700 text-white font-bold cursor-pointer"
               >
                 تلاش مجدد
@@ -703,6 +766,7 @@ export function Phase1Orders({ user, refreshTrigger, onNotify, onDataChanged }: 
                             <span className="text-[11px] font-bold text-emerald-700">امضای مشتری:</span>
                             <AuthenticatedImage
                               fileId={order.signatureFileId}
+                              fileUrl={order.signatureUrl}
                               alt={`امضای تحویل ${order.customer}`}
                               className="h-9 max-w-[120px] object-contain"
                             />
@@ -1141,47 +1205,47 @@ export function Phase1Orders({ user, refreshTrigger, onNotify, onDataChanged }: 
       <ConvertInvoiceModal
         order={convertOrder}
         onClose={() => setConvertOrder(null)}
-        onDone={(_, msg) => {
+        onDone={(updated, msg) => {
+          mergeOrderLocal(updated);
           onNotify(msg);
           onDataChanged();
-          fetchOrders();
         }}
       />
       <WarehouseExitModal
         order={exitOrder}
         onClose={() => setExitOrder(null)}
-        onDone={(_, msg) => {
+        onDone={(updated, msg) => {
+          mergeOrderLocal(updated);
           onNotify(msg);
           onDataChanged();
-          fetchOrders();
         }}
       />
       <DriverDeliveryModal
         order={deliveryOrder}
         onClose={() => setDeliveryOrder(null)}
-        onDone={(_, msg) => {
+        onDone={(updated, msg) => {
+          mergeOrderLocal(updated);
           onNotify(msg);
           onDataChanged();
-          fetchOrders();
         }}
       />
       <ReturnOrderModal
         order={returnState?.order ?? null}
         target={returnState?.target ?? null}
         onClose={() => setReturnState(null)}
-        onDone={(_, msg) => {
+        onDone={(updated, msg) => {
+          mergeOrderLocal(updated);
           onNotify(msg);
           onDataChanged();
-          fetchOrders();
         }}
       />
       <ReviseOrderModal
         order={reviseOrder}
         onClose={() => setReviseOrder(null)}
-        onDone={(_, msg) => {
+        onDone={(updated, msg) => {
+          mergeOrderLocal(updated);
           onNotify(msg);
           onDataChanged();
-          fetchOrders();
         }}
       />
       <OrderDocumentModal

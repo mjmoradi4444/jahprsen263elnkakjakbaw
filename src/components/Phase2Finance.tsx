@@ -1,6 +1,7 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertCircle, CalendarClock, CheckCircle2, Plus, Upload } from 'lucide-react';
-import { api, ApiError, ChecksListResponse } from '../api/client';
+import { api, ApiError } from '../api/client';
+import { buildChecksViewState, computeLatestCursor, mergeIncrementalRecords } from '../shared/sync';
 import { CheckAttachmentRecord, CheckRecord, UserAccountPublic } from '../shared/types';
 import {
   canRoleReviseCheck,
@@ -28,7 +29,7 @@ export function Phase2Finance({ user, roles, refreshTrigger, onNotify, onDataCha
   const [sortBy, setSortBy] = useState<'updated' | 'due_date'>('due_date');
   const [showUploadForm, setShowUploadForm] = useState(false);
 
-  const [data, setData] = useState<ChecksListResponse | null>(null);
+  const [allChecks, setAllChecks] = useState<CheckRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -54,21 +55,84 @@ export function Phase2Finance({ user, roles, refreshTrigger, onNotify, onDataCha
   const [rejectCheck, setRejectCheck] = useState<CheckRecord | null>(null);
   const [reviseCheck, setReviseCheck] = useState<CheckRecord | null>(null);
 
-  const fetchChecks = useCallback(async () => {
+  const lastSyncCursorRef = useRef<string | null>(null);
+  const inFlightSyncRef = useRef(false);
+  const initialRefreshRef = useRef(refreshTrigger);
+
+  const mergeCheckLocal = useCallback((updatedCheck: CheckRecord) => {
+    setAllChecks((prev) => mergeIncrementalRecords(prev, [updatedCheck]));
+    lastSyncCursorRef.current = computeLatestCursor([updatedCheck.updatedAt], lastSyncCursorRef.current);
+  }, []);
+
+  const loadInitialChecks = useCallback(async () => {
     setError(null);
+    setLoading(true);
     try {
-      const res = await api.getChecks({ filter, owner: ownerFilter, sort: sortBy });
-      setData(res);
+      const snapshot = await api.syncChanges(null);
+      setAllChecks(snapshot.checks);
+      lastSyncCursorRef.current =
+        snapshot.cursor ||
+        computeLatestCursor(
+          snapshot.checks.map((c) => c.updatedAt),
+          null,
+        );
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'خطا در دریافت اطلاعات مالی.');
     } finally {
       setLoading(false);
     }
-  }, [filter, ownerFilter, sortBy]);
+  }, []);
+
+  const runIncrementalSync = useCallback(async () => {
+    if (inFlightSyncRef.current) return;
+    if (!lastSyncCursorRef.current) {
+      await loadInitialChecks();
+      return;
+    }
+    inFlightSyncRef.current = true;
+    try {
+      const delta = await api.syncChanges(lastSyncCursorRef.current);
+      lastSyncCursorRef.current = delta.cursor;
+      if (delta.checks.length > 0) {
+        setAllChecks((prev) => mergeIncrementalRecords(prev, delta.checks));
+      }
+    } catch {
+      // Transient sync errors are retried on next incremental tick
+    } finally {
+      inFlightSyncRef.current = false;
+    }
+  }, [loadInitialChecks]);
 
   useEffect(() => {
-    fetchChecks();
-  }, [fetchChecks, refreshTrigger]);
+    lastSyncCursorRef.current = null;
+    loadInitialChecks();
+  }, [user.id, loadInitialChecks]);
+
+  useEffect(() => {
+    if (refreshTrigger === initialRefreshRef.current) return;
+    initialRefreshRef.current = refreshTrigger;
+    runIncrementalSync();
+  }, [refreshTrigger, runIncrementalSync]);
+
+  // Lightweight 4.5s incremental sync (`updated_at > cursor`) — zero unchanged rows downloaded
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        runIncrementalSync();
+      }
+    }, 4_500);
+    return () => clearInterval(timer);
+  }, [runIncrementalSync]);
+
+  const data = useMemo(
+    () =>
+      buildChecksViewState(allChecks, user, roles, {
+        filter,
+        owner: ownerFilter,
+        sort: sortBy,
+      }),
+    [allChecks, user, roles, filter, ownerFilter, sortBy],
+  );
 
   const canUpload = user.isSales || user.id === 'accounting';
   const uploaderRoles = roles.filter((r) => r.isSales || r.id === 'accounting');
@@ -112,6 +176,7 @@ export function Phase2Finance({ user, roles, refreshTrigger, onNotify, onDataCha
         caption: caption.trim(),
         fileIds: uploadedFiles.map((f) => f.fileId),
       });
+      mergeCheckLocal(res.check);
       setCustomer('');
       setAmount('');
       setSayadiId('');
@@ -122,7 +187,6 @@ export function Phase2Finance({ user, roles, refreshTrigger, onNotify, onDataCha
       setShowUploadForm(false);
       onNotify(`${res.check.docType} برای «${res.check.customer}» ثبت و جهت تایید دوگانه ارسال شد.`);
       onDataChanged();
-      await fetchChecks();
     } catch (err) {
       setFormError(err instanceof ApiError ? err.message : 'خطا در ثبت مدرک مالی.');
     } finally {
@@ -134,15 +198,16 @@ export function Phase2Finance({ user, roles, refreshTrigger, onNotify, onDataCha
     setBusyId(check.id);
     try {
       const res = await api.approveCheck(check.id);
+      mergeCheckLocal(res.check);
       onNotify(
         res.check.status === 'finalized'
           ? `${check.docType} «${check.customer}» با تایید دوگانه نهایی شد.`
           : `تایید شما برای «${check.customer}» ثبت شد (در انتظار تایید دوم).`,
       );
       onDataChanged();
-      await fetchChecks();
     } catch (err) {
       onNotify(err instanceof ApiError ? err.message : 'خطا در ثبت تایید.', true);
+      await runIncrementalSync();
     } finally {
       setBusyId(null);
     }
@@ -551,6 +616,7 @@ export function Phase2Finance({ user, roles, refreshTrigger, onNotify, onDataCha
                       >
                         <AuthenticatedImage
                           fileId={att.fileId}
+                          fileUrl={att.fileUrl}
                           alt={att.originalName}
                           className="w-full h-full object-cover"
                         />
@@ -691,19 +757,19 @@ export function Phase2Finance({ user, roles, refreshTrigger, onNotify, onDataCha
       <CheckRejectModal
         check={rejectCheck}
         onClose={() => setRejectCheck(null)}
-        onDone={(_, msg) => {
+        onDone={(updated, msg) => {
+          mergeCheckLocal(updated);
           onNotify(msg);
           onDataChanged();
-          fetchChecks();
         }}
       />
       <CheckReviseModal
         check={reviseCheck}
         onClose={() => setReviseCheck(null)}
-        onDone={(_, msg) => {
+        onDone={(updated, msg) => {
+          mergeCheckLocal(updated);
           onNotify(msg);
           onDataChanged();
-          fetchChecks();
         }}
       />
     </div>

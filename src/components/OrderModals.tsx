@@ -467,15 +467,23 @@ export function DriverDeliveryModal({ order, onClose, onDone }: DriverDeliveryMo
       return;
     }
 
-    const signaturePngBase64 = canvasRef.current.toDataURL('image/png');
     setSubmitting(true);
     try {
+      const pngBlob = await new Promise<Blob | null>((resolve) =>
+        canvasRef.current?.toBlob((blob) => resolve(blob), 'image/png'),
+      );
+      if (!pngBlob) {
+        throw new Error('خطا در تولید فایل تصویر امضا.');
+      }
+      const sigFile = new File([pngBlob], `signature-${order.proforma}.png`, { type: 'image/png' });
+      const uploadedSig = await api.uploadFile(sigFile, 'signature');
+
       const res = await api.driverDelivery(order.id, {
         expectedVersion: order.version,
         cartonsDelivered: parsedDelivered,
         customerSigner: signer.trim(),
         discrepancyNote: discrepancyNote.trim(),
-        signaturePngBase64,
+        signatureFileId: uploadedSig.fileId,
       });
       onDone(
         res.order,
@@ -485,7 +493,7 @@ export function DriverDeliveryModal({ order, onClose, onDone }: DriverDeliveryMo
       );
       onClose();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'خطا در ثبت تحویل نهایی.');
+      setError(err instanceof ApiError ? err.message : err instanceof Error ? err.message : 'خطا در ثبت تحویل نهایی.');
     } finally {
       setSubmitting(false);
     }
@@ -1018,7 +1026,7 @@ interface OrderDocumentModalProps {
 export function OrderDocumentModal({ order, initialMode, onClose }: OrderDocumentModalProps) {
   const [selectedDoc, setSelectedDoc] = useState<OrderDocumentRecord | null>(null);
   const [viewMode, setViewMode] = useState<'sheet' | 'file'>('sheet');
-  const [blobState, setBlobState] = useState<{ url: string; mimeType: string } | null>(null);
+  const [blobState, setBlobState] = useState<{ url: string; mimeType: string; revoke: boolean } | null>(null);
   const [loadingFile, setLoadingFile] = useState(false);
 
   useEffect(() => {
@@ -1031,24 +1039,24 @@ export function OrderDocumentModal({ order, initialMode, onClose }: OrderDocumen
   useEffect(() => {
     if (!selectedDoc || viewMode !== 'file') {
       setBlobState((prev) => {
-        if (prev) URL.revokeObjectURL(prev.url);
+        if (prev?.revoke) URL.revokeObjectURL(prev.url);
         return null;
       });
       return;
     }
 
     let active = true;
-    let createdUrl: string | null = null;
+    let revocableUrl: string | null = null;
     setLoadingFile(true);
     api
-      .fetchFileBlobUrl(selectedDoc.fileId)
+      .resolveFileDisplayUrl(selectedDoc.fileId, selectedDoc.fileUrl, selectedDoc.mimeType)
       .then((res) => {
         if (!active) {
-          URL.revokeObjectURL(res.blobUrl);
+          if (res.revoke) URL.revokeObjectURL(res.url);
           return;
         }
-        createdUrl = res.blobUrl;
-        setBlobState({ url: res.blobUrl, mimeType: res.mimeType });
+        if (res.revoke) revocableUrl = res.url;
+        setBlobState({ url: res.url, mimeType: res.mimeType, revoke: res.revoke });
       })
       .catch(() => {
         if (active) setBlobState(null);
@@ -1059,7 +1067,7 @@ export function OrderDocumentModal({ order, initialMode, onClose }: OrderDocumen
 
     return () => {
       active = false;
-      if (createdUrl) URL.revokeObjectURL(createdUrl);
+      if (revocableUrl) URL.revokeObjectURL(revocableUrl);
     };
   }, [selectedDoc, viewMode]);
 
@@ -1134,7 +1142,7 @@ export function OrderDocumentModal({ order, initialMode, onClose }: OrderDocumen
             {selectedDoc && (
               <button
                 type="button"
-                onClick={() => api.downloadFile(selectedDoc.fileId, selectedDoc.originalName)}
+                onClick={() => api.downloadFile(selectedDoc.fileId, selectedDoc.originalName, selectedDoc.fileUrl)}
                 className="mr-auto inline-flex items-center gap-1 px-2.5 py-1 rounded-md border border-slate-300 bg-white text-xs font-bold text-slate-800 hover:bg-slate-100 cursor-pointer"
               >
                 <Download className="w-3.5 h-3.5" />

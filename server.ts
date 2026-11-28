@@ -9,13 +9,8 @@ const PORT = Number(process.env.PORT || 3000);
 async function startServer(): Promise<void> {
   const app = express();
   app.disable('x-powered-by');
-  // Behind a reverse proxy (Render, Railway, Liara, Nginx...) set TRUST_PROXY=1 so the login
-  // rate limiter sees each client's real IP instead of locking everyone out via the proxy's IP.
-  if (process.env.TRUST_PROXY === '1') {
-    app.set('trust proxy', 1);
-  }
 
-  app.use(express.json({ limit: '6mb' }));
+  app.use(express.json({ limit: '1mb' }));
   app.use(express.urlencoded({ extended: false }));
 
   // Mount authenticated REST & SSE API

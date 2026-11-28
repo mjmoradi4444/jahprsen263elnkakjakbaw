@@ -1,7 +1,5 @@
 import crypto from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
-import express, { NextFunction, Request, Response } from 'express';
+import express, { Response } from 'express';
 import multer from 'multer';
 import {
   addAuditLog,
@@ -16,18 +14,46 @@ import {
   isSystemInitialized,
   listPublicRoles,
   setSetting,
-  UPLOADS_DIR,
   verifyPinHash,
 } from './db';
 import {
+  AuthedRequest,
+  createAuthMiddleware,
+  evaluateFileRbac,
+  extractBearerToken,
+  requireFinanceAccess,
+  requireProcurementAccess,
+  requireRoles,
+  requireSalesRole,
+} from './middleware/rbac';
+import {
+  fetchFileFromStorage,
+  MAX_UPLOAD_BYTES,
+  resolveStorageAccessUrl,
+  uploadFileToStorage,
+} from './storage';
+import {
+  fetchIncrementalFromSupabase,
+  syncCheckToSupabase,
+  syncFileMetadataToSupabase,
+  syncOrderToSupabase,
+  syncProcurementToSupabase,
+} from './supabase-sync';
+import {
   AuditLogEntry,
   CheckRecord,
+  IncrementalSyncResponse,
   OrderRecord,
+  ProcurementItem,
   ProcurementStatus,
   RoleId,
   StageHistoryEntry,
   UserAccountPublic,
 } from '../src/shared/types';
+import {
+  computeLatestCursor,
+  parseSinceCursor,
+} from '../src/shared/sync';
 import {
   buildBoundedWhatsAppSummary,
   canRoleAccessFinance,
@@ -37,19 +63,11 @@ import {
   canRoleViewOrder,
   computeCartonDiscrepancy,
   CURRENT_SCHEMA_VERSION,
-  detectSafeFileType,
   normalizeDigits,
   parseAmountToman,
   projectOrderForRole,
   validateSayadiId,
 } from '../src/shared/workflow';
-
-interface AuthedRequest extends Request {
-  user?: UserAccountPublic;
-  sessionTokenHash?: string;
-}
-
-const MAX_UPLOAD_BYTES = 5 * 1024 * 1024; // 5 MB strict cap
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -70,16 +88,7 @@ function broadcastChange(scope: 'orders' | 'checks' | 'procurement' | 'settings'
   }
 }
 
-// ==================== Auth Middleware ====================
-function extractBearerToken(req: Request): string | null {
-  const header = req.headers.authorization;
-  if (header && header.startsWith('Bearer ')) {
-    const token = header.slice(7).trim();
-    if (token.length >= 32) return token;
-  }
-  return null;
-}
-
+// ==================== Session Verification & RBAC Middleware ====================
 function authenticateToken(rawToken: string): { user: UserAccountPublic; tokenHash: string } | null {
   const tokenHash = hashSessionToken(rawToken);
   const nowIso = new Date().toISOString();
@@ -98,21 +107,7 @@ function authenticateToken(rawToken: string): { user: UserAccountPublic; tokenHa
   return { user, tokenHash };
 }
 
-function requireAuth(req: AuthedRequest, res: Response, next: NextFunction): void {
-  const token = extractBearerToken(req);
-  if (!token) {
-    res.status(401).json({ error: 'لطفاً ابتدا وارد کارتابل سازمانی شوید.' });
-    return;
-  }
-  const auth = authenticateToken(token);
-  if (!auth) {
-    res.status(401).json({ error: 'نشست شما منقضی شده است؛ لطفاً مجدداً وارد شوید.' });
-    return;
-  }
-  req.user = auth.user;
-  req.sessionTokenHash = auth.tokenHash;
-  next();
-}
+const requireAuth = createAuthMiddleware(authenticateToken);
 
 function createSessionForUser(userId: string): { token: string; expiresAt: string } {
   const rawToken = crypto.randomBytes(32).toString('hex');
@@ -126,49 +121,6 @@ function createSessionForUser(userId: string): { token: string; expiresAt: strin
     expiresAt,
   );
   return { token: rawToken, expiresAt };
-}
-
-function sanitizeOriginalName(name: string): string {
-  const base = path.basename(name || 'document').replace(/[^\w.\-\u0600-\u06FF ]/g, '_');
-  return base.slice(0, 120) || 'document';
-}
-
-function saveValidatedBufferAsFile(
-  buf: Buffer,
-  originalName: string,
-  ownerKind: 'order_doc' | 'signature' | 'check_attachment' | 'temp',
-  uploadedBy: string,
-  allowPdf: boolean,
-): { fileId: string; mimeType: string; originalName: string } {
-  if (buf.length === 0 || buf.length > MAX_UPLOAD_BYTES) {
-    throw new Error('حجم فایل باید بین ۱ بایت تا ۵ مگابایت باشد.');
-  }
-
-  const detected = detectSafeFileType(new Uint8Array(buf));
-  if (!detected.allowed || !detected.mimeType || !detected.ext) {
-    throw new Error('فرمت فایل نامعتبر است. فقط PDF، PNG، JPEG و WebP معتبر مجاز هستند.');
-  }
-  if (!allowPdf && detected.mimeType === 'application/pdf') {
-    throw new Error('برای این بخش فقط تصویر معتبر (PNG/JPEG/WebP) مجاز است.');
-  }
-
-  const fileId = `fil-${crypto.randomUUID()}`;
-  const storedFilename = `${fileId}${detected.ext}`;
-  const resolvedDest = path.resolve(UPLOADS_DIR, storedFilename);
-  if (!resolvedDest.startsWith(UPLOADS_DIR + path.sep)) {
-    throw new Error('مسیر ذخیره‌سازی فایل نامعتبر است.');
-  }
-
-  fs.writeFileSync(resolvedDest, buf);
-  const cleanName = sanitizeOriginalName(originalName);
-  const now = new Date().toISOString();
-
-  db.prepare(`
-    INSERT INTO files (id, stored_filename, original_name, mime_type, size_bytes, owner_kind, owner_record_id, uploaded_by, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
-  `).run(fileId, storedFilename, cleanName, detected.mimeType, buf.length, ownerKind, uploadedBy, now);
-
-  return { fileId, mimeType: detected.mimeType, originalName: cleanName };
 }
 
 // ==================== Express Router ====================
@@ -366,9 +318,9 @@ export function createApiRouter(): express.Router {
     });
   });
 
-  // ==================== Secure File Upload & Authenticated Serving ====================
+  // ==================== Secure Supabase Storage Upload & RBAC-Gated Serving ====================
   router.post('/files', requireAuth, (req: AuthedRequest, res) => {
-    upload.single('file')(req, res, (err) => {
+    upload.single('file')(req, res, async (err) => {
       if (err) {
         if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
           res.status(413).json({ error: 'حجم فایل بیشتر از ۵ مگابایت است. فایل قبلی بدون تغییر حفظ شد.' });
@@ -384,17 +336,59 @@ export function createApiRouter(): express.Router {
       }
 
       const kind = String(req.body?.kind || 'order_doc');
-      const allowPdf = kind === 'order_doc';
+      const ownerKind =
+        kind === 'check_attachment' ? 'check_attachment' : kind === 'signature' ? 'signature' : 'order_doc';
+      const allowPdf = ownerKind === 'order_doc';
+
+      // RBAC check before storing binary object
+      if (ownerKind === 'check_attachment' && !canRoleAccessFinance(req.user!.id)) {
+        res.status(403).json({ error: 'نقش شما مجاز به بارگذاری مدارک مالی نیست.' });
+        return;
+      }
+      if (ownerKind === 'signature' && req.user!.id !== 'driver') {
+        res.status(403).json({ error: 'ثبت تصویر امضای تحویل فقط برای راننده مجاز است.' });
+        return;
+      }
 
       try {
-        const saved = saveValidatedBufferAsFile(
-          req.file.buffer,
-          req.file.originalname,
-          kind === 'check_attachment' ? 'check_attachment' : kind === 'signature' ? 'signature' : 'order_doc',
-          req.user!.id,
+        const stored = await uploadFileToStorage({
+          buffer: req.file.buffer,
+          originalName: req.file.originalname,
+          ownerKind,
           allowPdf,
+        });
+
+        const now = new Date().toISOString();
+        db.prepare(`
+          INSERT INTO files (
+            id, storage_provider, storage_bucket, storage_path, storage_url, stored_filename,
+            original_name, mime_type, size_bytes, owner_kind, owner_record_id, uploaded_by, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+        `).run(
+          stored.fileId,
+          stored.storageProvider,
+          stored.storageBucket,
+          stored.storagePath,
+          stored.storageUrl,
+          stored.storedFilename,
+          stored.originalName,
+          stored.mimeType,
+          stored.sizeBytes,
+          ownerKind,
+          req.user!.id,
+          now,
         );
-        res.status(201).json(saved);
+
+        await syncFileMetadataToSupabase(req.supabase, stored, ownerKind, null, req.user!.id);
+
+        res.status(201).json({
+          fileId: stored.fileId,
+          fileUrl: stored.storageUrl,
+          storageUrl: stored.storageUrl,
+          mimeType: stored.mimeType,
+          originalName: stored.originalName,
+          storageProvider: stored.storageProvider,
+        });
       } catch (validationErr) {
         res.status(400).json({
           error: validationErr instanceof Error ? validationErr.message : 'فایل نامعتبر است.',
@@ -403,15 +397,40 @@ export function createApiRouter(): express.Router {
     });
   });
 
-  router.get('/files/:id', requireAuth, (req: AuthedRequest, res) => {
-    const fileId = String(req.params.id || '').trim();
-    const user = req.user!;
-
+  function loadAndAuthorizeFile(
+    fileId: string,
+    user: UserAccountPublic,
+  ):
+    | {
+        ok: true;
+        fileRow: {
+          id: string;
+          storage_provider: string;
+          storage_bucket: string;
+          storage_path: string;
+          storage_url: string;
+          stored_filename: string;
+          original_name: string;
+          mime_type: string;
+          owner_kind: string;
+          owner_record_id: string | null;
+          uploaded_by: string;
+        };
+      }
+    | { ok: false; status: number; error: string } {
     const fileRow = db
-      .prepare(`SELECT id, stored_filename, original_name, mime_type, owner_kind, owner_record_id, uploaded_by FROM files WHERE id = ?`)
+      .prepare(`
+        SELECT id, storage_provider, storage_bucket, storage_path, storage_url, stored_filename,
+               original_name, mime_type, owner_kind, owner_record_id, uploaded_by
+        FROM files WHERE id = ?
+      `)
       .get(fileId) as
       | {
           id: string;
+          storage_provider: string;
+          storage_bucket: string;
+          storage_path: string;
+          storage_url: string;
           stored_filename: string;
           original_name: string;
           mime_type: string;
@@ -422,43 +441,62 @@ export function createApiRouter(): express.Router {
       | undefined;
 
     if (!fileRow) {
-      res.status(404).json({ error: 'فایل مورد نظر یافت نشد.' });
+      return { ok: false, status: 404, error: 'فایل مورد نظر یافت نشد.' };
+    }
+
+    let checkSalesOwnerId: string | null = null;
+    let orderMeta: { salesOwnerId: string; stage: number; status: OrderRecord['status'] } | null = null;
+
+    if (fileRow.owner_kind === 'check_attachment' && fileRow.owner_record_id) {
+      const chk = db
+        .prepare(`SELECT sales_owner_id FROM checks WHERE id = ?`)
+        .get(fileRow.owner_record_id) as { sales_owner_id: string } | undefined;
+      checkSalesOwnerId = chk?.sales_owner_id ?? null;
+    } else if ((fileRow.owner_kind === 'order_doc' || fileRow.owner_kind === 'signature') && fileRow.owner_record_id) {
+      const ord = db
+        .prepare(`SELECT sales_owner_id, stage, status FROM orders WHERE id = ?`)
+        .get(fileRow.owner_record_id) as
+        | { sales_owner_id: string; stage: number; status: OrderRecord['status'] }
+        | undefined;
+      if (ord) {
+        orderMeta = { salesOwnerId: ord.sales_owner_id, stage: ord.stage, status: ord.status };
+      }
+    }
+
+    const rbacCheck = evaluateFileRbac({
+      user,
+      ownerKind: fileRow.owner_kind,
+      uploadedBy: fileRow.uploaded_by,
+      ownerRecordId: fileRow.owner_record_id,
+      checkSalesOwnerId,
+      orderMeta,
+    });
+
+    if (!rbacCheck.allowed) {
+      return { ok: false, status: 403, error: rbacCheck.error || 'دسترسی به این فایل مجاز نیست.' };
+    }
+
+    return { ok: true, fileRow };
+  }
+
+  router.get('/files/:id', requireAuth, async (req: AuthedRequest, res) => {
+    const fileId = String(req.params.id || '').trim();
+    const authz = loadAndAuthorizeFile(fileId, req.user!);
+    if (!authz.ok) {
+      res.status(authz.status).json({ error: authz.error });
       return;
     }
 
-    // Strict RBAC check on file ownership
-    if (fileRow.owner_kind === 'check_attachment') {
-      if (!canRoleAccessFinance(user.id)) {
-        res.status(403).json({ error: 'دسترسی به تصاویر اسناد مالی برای این نقش مجاز نیست.' });
-        return;
-      }
-      if (fileRow.owner_record_id && user.isSales) {
-        const chk = db
-          .prepare(`SELECT sales_owner_id FROM checks WHERE id = ?`)
-          .get(fileRow.owner_record_id) as { sales_owner_id: string } | undefined;
-        if (chk && chk.sales_owner_id !== user.id) {
-          res.status(403).json({ error: 'شما فقط مجاز به مشاهده مدارک مشتریان خود هستید.' });
-          return;
-        }
-      }
-    } else if (fileRow.owner_kind === 'order_doc' || fileRow.owner_kind === 'signature') {
-      if (fileRow.owner_record_id) {
-        const ord = db
-          .prepare(`SELECT sales_owner_id, stage, status FROM orders WHERE id = ?`)
-          .get(fileRow.owner_record_id) as
-          | { sales_owner_id: string; stage: number; status: OrderRecord['status'] }
-          | undefined;
-        if (ord && !canRoleViewOrder(user.id, { salesOwnerId: ord.sales_owner_id, stage: ord.stage, status: ord.status })) {
-          res.status(403).json({ error: 'دسترسی به فایل این سفارش برای شما مجاز نیست.' });
-          return;
-        }
-      }
-    }
+    const { fileRow } = authz;
+    const streamResult = await fetchFileFromStorage({
+      storageProvider: fileRow.storage_provider,
+      storageBucket: fileRow.storage_bucket,
+      storagePath: fileRow.storage_path,
+      storedFilename: fileRow.stored_filename,
+    });
 
-    // Strict path confinement check
-    const resolvedPath = path.resolve(UPLOADS_DIR, path.basename(fileRow.stored_filename));
-    if (!resolvedPath.startsWith(UPLOADS_DIR + path.sep) || !fs.existsSync(resolvedPath)) {
-      res.status(404).json({ error: 'فایل روی سرور موجود نیست.' });
+    if (!streamResult) {
+      res.status(404).json({ error: 'فایل در مخزن ذخیره‌سازی یافت نشد.' });
       return;
     }
 
@@ -473,7 +511,122 @@ export function createApiRouter(): express.Router {
       res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(fileRow.original_name)}`);
     }
 
-    fs.createReadStream(resolvedPath).pipe(res);
+    streamResult.stream.pipe(res);
+  });
+
+  // Supabase Storage URL resolver (public URL when SUPABASE_STORAGE_PUBLIC=true, else 60s RBAC-gated signed URL)
+  router.post('/files/:id/signed-url', requireAuth, async (req: AuthedRequest, res) => {
+    const fileId = String(req.params.id || '').trim();
+    const authz = loadAndAuthorizeFile(fileId, req.user!);
+    if (!authz.ok) {
+      res.status(authz.status).json({ error: authz.error });
+      return;
+    }
+
+    const { fileRow } = authz;
+    const access = await resolveStorageAccessUrl({
+      fileId: fileRow.id,
+      storageProvider: fileRow.storage_provider,
+      storageBucket: fileRow.storage_bucket,
+      storagePath: fileRow.storage_path,
+      storageUrl: fileRow.storage_url,
+      expiresInSeconds: 60,
+    });
+
+    res.json({
+      url: access.url,
+      accessMode: access.accessMode,
+      mimeType: fileRow.mime_type,
+      originalName: fileRow.original_name,
+      storageProvider: access.storageProvider,
+      expiresInSeconds: access.expiresInSeconds,
+    });
+  });
+
+  // ==================== Incremental Fetching Endpoint (`updated_at > since`) ====================
+  router.get('/sync', requireAuth, async (req: AuthedRequest, res) => {
+    const user = req.user!;
+    const rawSince = req.query.since;
+    if (rawSince !== undefined && rawSince !== '' && parseSinceCursor(rawSince) === null) {
+      res.status(400).json({ error: 'پارامتر since باید تاریخ معتبر با فرمت استاندارد ISO-8601 باشد.' });
+      return;
+    }
+
+    const since = parseSinceCursor(rawSince);
+    const serverTime = new Date().toISOString();
+
+    let source: 'supabase' | 'local' = 'local';
+    let orders: OrderRecord[] = [];
+    let checks: CheckRecord[] = [];
+    let procurement: ProcurementItem[] = [];
+
+    // Prefer Supabase incremental fetch (`updated_at > since`) under role-scoped RLS when configured
+    const supabaseDelta = await fetchIncrementalFromSupabase(req.supabase, user, since);
+    if (supabaseDelta) {
+      source = 'supabase';
+      orders = supabaseDelta.orders
+        .filter((o) => canRoleViewOrder(user.id, o))
+        .map((o) => projectOrderForRole(user.id, o));
+      checks = canRoleAccessFinance(user.id)
+        ? supabaseDelta.checks.filter((c) => (user.isSales ? c.salesOwnerId === user.id : true))
+        : [];
+      procurement = canRoleAccessProcurement(user.id) ? supabaseDelta.procurement : [];
+    } else {
+      // Parameterized SQLite incremental query (`WHERE updated_at > ?`)
+      const orderRows = since
+        ? (db
+            .prepare(`SELECT * FROM orders WHERE updated_at > ? ORDER BY updated_at DESC`)
+            .all(since) as Array<Record<string, unknown>>)
+        : (db.prepare(`SELECT * FROM orders ORDER BY updated_at DESC`).all() as Array<Record<string, unknown>>);
+
+      orders = orderRows
+        .map(hydrateOrderRow)
+        .filter((o) => canRoleViewOrder(user.id, o))
+        .map((o) => projectOrderForRole(user.id, o));
+
+      if (canRoleAccessFinance(user.id)) {
+        const checkRows = since
+          ? (db
+              .prepare(`SELECT * FROM checks WHERE updated_at > ? ORDER BY updated_at DESC`)
+              .all(since) as Array<Record<string, unknown>>)
+          : (db.prepare(`SELECT * FROM checks ORDER BY updated_at DESC`).all() as Array<Record<string, unknown>>);
+
+        checks = checkRows
+          .map(hydrateCheckRow)
+          .filter((c) => (user.isSales ? c.salesOwnerId === user.id : true));
+      }
+
+      if (canRoleAccessProcurement(user.id)) {
+        const procRows = since
+          ? (db
+              .prepare(`SELECT * FROM procurement_items WHERE updated_at > ? ORDER BY updated_at DESC`)
+              .all(since) as Array<Record<string, unknown>>)
+          : (db
+              .prepare(`SELECT * FROM procurement_items ORDER BY updated_at DESC`)
+              .all() as Array<Record<string, unknown>>);
+
+        procurement = procRows.map(hydrateProcurementRow);
+      }
+    }
+
+    const timestamps = [
+      ...orders.map((o) => o.updatedAt),
+      ...checks.map((c) => c.updatedAt),
+      ...procurement.map((p) => p.updatedAt),
+    ];
+    const cursor = computeLatestCursor(timestamps, since) || serverTime;
+    const payload: IncrementalSyncResponse = {
+      cursor,
+      serverTime,
+      since,
+      isIncremental: Boolean(since),
+      source,
+      changedCount: orders.length + checks.length + procurement.length,
+      orders,
+      checks,
+      procurement,
+    };
+    res.json(payload);
   });
 
   // ==================== Orders Endpoints (Phase 1) ====================
@@ -486,7 +639,10 @@ export function createApiRouter(): express.Router {
     const page = Math.max(1, Number(req.query.page || 1));
     const limit = Math.min(50, Math.max(5, Number(req.query.limit || 20)));
 
-    const allRows = db.prepare(`SELECT * FROM orders ORDER BY updated_at DESC`).all() as Array<Record<string, unknown>>;
+    const since = parseSinceCursor(req.query.since);
+    const allRows = since
+      ? (db.prepare(`SELECT * FROM orders WHERE updated_at > ? ORDER BY updated_at DESC`).all(since) as Array<Record<string, unknown>>)
+      : (db.prepare(`SELECT * FROM orders ORDER BY updated_at DESC`).all() as Array<Record<string, unknown>>);
     const visibleAll = allRows
       .map(hydrateOrderRow)
       .filter((o) => canRoleViewOrder(user.id, o))
@@ -574,22 +730,21 @@ export function createApiRouter(): express.Router {
     const safePage = Math.min(page, totalPages);
     const items = filtered.slice((safePage - 1) * limit, safePage * limit);
 
+    const syncCursor = computeLatestCursor(visibleAll.map((o) => o.updatedAt), since) || new Date().toISOString();
+
     res.json({
       items,
       pagination: { page: safePage, limit, total: totalFiltered, totalPages },
       stats,
       stageCounts,
       repBreakdown,
+      syncCursor,
     });
   });
 
-  // Create new proforma order (sales reps only, duplicate proforma guard, structured numeric amount)
-  router.post('/orders', requireAuth, (req: AuthedRequest, res) => {
+  // Create new proforma order (sales reps only via RBAC middleware, duplicate proforma guard, structured numeric amount)
+  router.post('/orders', requireAuth, requireSalesRole, async (req: AuthedRequest, res) => {
     const user = req.user!;
-    if (!user.isSales) {
-      res.status(403).json({ error: 'ثبت پیش‌فاکتور جدید فقط برای کارشناسان فروش مجاز است.' });
-      return;
-    }
 
     const customer = String(req.body?.customer || '').trim();
     const proforma = normalizeDigits(String(req.body?.proforma || '')).trim();
@@ -652,14 +807,15 @@ export function createApiRouter(): express.Router {
 
       if (fileId) {
         const fRow = db
-          .prepare(`SELECT id, original_name, mime_type, uploaded_by FROM files WHERE id = ?`)
-          .get(fileId) as { id: string; original_name: string; mime_type: string; uploaded_by: string } | undefined;
+          .prepare(`SELECT id, storage_url, original_name, mime_type, uploaded_by FROM files WHERE id = ?`)
+          .get(fileId) as { id: string; storage_url: string; original_name: string; mime_type: string; uploaded_by: string } | undefined;
         if (fRow && fRow.uploaded_by === user.id) {
+          const resolvedUrl = fRow.storage_url || `/api/files/${encodeURIComponent(fRow.id)}`;
           db.prepare(`UPDATE files SET owner_kind = 'order_doc', owner_record_id = ? WHERE id = ?`).run(orderId, fileId);
           db.prepare(`
-            INSERT INTO order_documents (id, order_id, doc_kind, version_no, file_id, original_name, mime_type, uploaded_by, created_at)
-            VALUES (?, ?, 'proforma', 1, ?, ?, ?, ?, ?)
-          `).run(`doc-${crypto.randomUUID().slice(0, 8)}`, orderId, fRow.id, fRow.original_name, fRow.mime_type, user.displayName, now);
+            INSERT INTO order_documents (id, order_id, doc_kind, version_no, file_id, file_url, original_name, mime_type, uploaded_by, created_at)
+            VALUES (?, ?, 'proforma', 1, ?, ?, ?, ?, ?, ?)
+          `).run(`doc-${crypto.randomUUID().slice(0, 8)}`, orderId, fRow.id, resolvedUrl, fRow.original_name, fRow.mime_type, user.displayName, now);
         }
       }
 
@@ -673,6 +829,7 @@ export function createApiRouter(): express.Router {
 
     tx();
     const created = hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(orderId) as Record<string, unknown>);
+    await syncOrderToSupabase(req.supabase, created).catch(() => {});
     broadcastChange('orders');
     res.status(201).json({ order: created });
   });
@@ -694,54 +851,64 @@ export function createApiRouter(): express.Router {
   }
 
   // Advance stages 2 -> 3 (sales_mgr) and 3 -> 4 (sales owner)
-  router.post('/orders/:id/advance', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.user!;
-    const expectedVersion = Number(req.body?.expectedVersion);
-    const check = getOrderWithVersionCheck(String(req.params.id), expectedVersion);
-    if (check.error || !check.order) {
-      res.status(check.error!.status).json({ error: check.error!.message });
-      return;
-    }
+  router.post(
+    '/orders/:id/advance',
+    requireAuth,
+    requireRoles(['sales_mgr', 'sales_1', 'sales_2', 'sales_3', 'sales_4'], 'شما مجاز به تایید این مرحله از سفارش نیستید.'),
+    async (req: AuthedRequest, res) => {
+      const user = req.user!;
+      const expectedVersion = Number(req.body?.expectedVersion);
+      const check = getOrderWithVersionCheck(String(req.params.id), expectedVersion);
+      if (check.error || !check.order) {
+        res.status(check.error!.status).json({ error: check.error!.message });
+        return;
+      }
 
-    const order = check.order;
-    if (!canRoleActOnOrder(user.id, order) || (order.stage !== 2 && order.stage !== 3) || order.status !== 'active') {
-      res.status(403).json({ error: 'شما مجاز به تایید این مرحله از سفارش نیستید.' });
-      return;
-    }
+      const order = check.order;
+      if (!canRoleActOnOrder(user.id, order) || (order.stage !== 2 && order.stage !== 3) || order.status !== 'active') {
+        res.status(403).json({ error: 'شما مجاز به تایید این مرحله از سفارش نیستید.' });
+        return;
+      }
 
-    const now = new Date().toISOString();
-    const nextStage = order.stage === 2 ? 3 : 4;
-    const actionLabel = order.stage === 2 ? 'تایید مدیر فروش' : 'ثبت تاییدیه مشتری';
-    const nextHistory: StageHistoryEntry[] = [
-      ...order.stageHistory,
-      { stage: order.stage, action: actionLabel, actorName: user.displayName, timestamp: now },
-    ];
+      const now = new Date().toISOString();
+      const nextStage = order.stage === 2 ? 3 : 4;
+      const actionLabel = order.stage === 2 ? 'تایید مدیر فروش' : 'ثبت تاییدیه مشتری';
+      const nextHistory: StageHistoryEntry[] = [
+        ...order.stageHistory,
+        { stage: order.stage, action: actionLabel, actorName: user.displayName, timestamp: now },
+      ];
 
-    const updated = db
-      .prepare(`UPDATE orders SET stage = ?, stage_history_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?`)
-      .run(nextStage, JSON.stringify(nextHistory), now, order.id, order.version);
+      const updated = db
+        .prepare(`UPDATE orders SET stage = ?, stage_history_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?`)
+        .run(nextStage, JSON.stringify(nextHistory), now, order.id, order.version);
 
-    if (updated.changes === 0) {
-      res.status(409).json({ error: 'تداخل ویرایش هم‌زمان رخ داد؛ لطفاً دوباره تلاش کنید.' });
-      return;
-    }
+      if (updated.changes === 0) {
+        res.status(409).json({ error: 'تداخل ویرایش هم‌زمان رخ داد؛ لطفاً دوباره تلاش کنید.' });
+        return;
+      }
 
-    addAuditLog(
-      user.id,
-      user.displayName,
-      'order',
-      order.stage === 2
-        ? `مدیر فروش پیش‌فاکتور «${order.proforma}» (${order.customer}) را تایید کرد و جهت اخذ تاییدیه مشتری ارسال نمود.`
-        : `تاییدیه مشتری برای پیش‌فاکتور «${order.proforma}» (${order.customer}) ثبت و به واحد حسابداری ارسال شد.`,
-    );
+      addAuditLog(
+        user.id,
+        user.displayName,
+        'order',
+        order.stage === 2
+          ? `مدیر فروش پیش‌فاکتور «${order.proforma}» (${order.customer}) را تایید کرد و جهت اخذ تاییدیه مشتری ارسال نمود.`
+          : `تاییدیه مشتری برای پیش‌فاکتور «${order.proforma}» (${order.customer}) ثبت و به واحد حسابداری ارسال شد.`,
+      );
 
-    const fresh = hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order.id) as Record<string, unknown>);
-    broadcastChange('orders');
-    res.json({ order: fresh });
-  });
+      const fresh = hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order.id) as Record<string, unknown>);
+      await syncOrderToSupabase(req.supabase, fresh).catch(() => {});
+      broadcastChange('orders');
+      res.json({ order: fresh });
+    },
+  );
 
   // Sales manager resolves return from accounting -> send back to accounting (stage 4)
-  router.post('/orders/:id/mgr-resolve', requireAuth, (req: AuthedRequest, res) => {
+  router.post(
+    '/orders/:id/mgr-resolve',
+    requireAuth,
+    requireRoles(['sales_mgr'], 'این اقدام فقط برای مدیر فروش در وضعیت عودت مالی مجاز است.'),
+    async (req: AuthedRequest, res) => {
     const user = req.user!;
     const expectedVersion = Number(req.body?.expectedVersion);
     const check = getOrderWithVersionCheck(String(req.params.id), expectedVersion);
@@ -777,12 +944,17 @@ export function createApiRouter(): express.Router {
 
     addAuditLog(user.id, user.displayName, 'order', `مدیر فروش مغایرت پیش‌فاکتور «${order.proforma}» (${order.customer}) را بررسی و به حسابداری ارسال کرد.`);
     const fresh = hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order.id) as Record<string, unknown>);
+    await syncOrderToSupabase(req.supabase, fresh).catch(() => {});
     broadcastChange('orders');
     res.json({ order: fresh });
   });
 
   // Stage 4: Accounting converts proforma to final invoice (or fixes warehouse return) — PRESERVES proforma doc history!
-  router.post('/orders/:id/convert-invoice', requireAuth, (req: AuthedRequest, res) => {
+  router.post(
+    '/orders/:id/convert-invoice',
+    requireAuth,
+    requireRoles(['accounting'], 'تبدیل یا اصلاح فاکتور فقط برای واحد حسابداری در مرحله ۴ مجاز است.'),
+    async (req: AuthedRequest, res) => {
     const user = req.user!;
     const expectedVersion = Number(req.body?.expectedVersion);
     const check = getOrderWithVersionCheck(String(req.params.id), expectedVersion);
@@ -862,23 +1034,25 @@ export function createApiRouter(): express.Router {
       // Append final invoice document WITHOUT deleting/overwriting the original proforma!
       if (fileId) {
         const fRow = db
-          .prepare(`SELECT id, original_name, mime_type, uploaded_by FROM files WHERE id = ?`)
-          .get(fileId) as { id: string; original_name: string; mime_type: string; uploaded_by: string } | undefined;
+          .prepare(`SELECT id, storage_url, original_name, mime_type, uploaded_by FROM files WHERE id = ?`)
+          .get(fileId) as { id: string; storage_url: string; original_name: string; mime_type: string; uploaded_by: string } | undefined;
         if (fRow && fRow.uploaded_by === user.id) {
           const maxVer = (
             db
               .prepare(`SELECT COALESCE(MAX(version_no), 0) as mv FROM order_documents WHERE order_id = ? AND doc_kind = 'final_invoice'`)
               .get(order.id) as { mv: number }
           ).mv;
+          const resolvedUrl = fRow.storage_url || `/api/files/${encodeURIComponent(fRow.id)}`;
           db.prepare(`UPDATE files SET owner_kind = 'order_doc', owner_record_id = ? WHERE id = ?`).run(order.id, fileId);
           db.prepare(`
-            INSERT INTO order_documents (id, order_id, doc_kind, version_no, file_id, original_name, mime_type, uploaded_by, created_at)
-            VALUES (?, ?, 'final_invoice', ?, ?, ?, ?, ?, ?)
+            INSERT INTO order_documents (id, order_id, doc_kind, version_no, file_id, file_url, original_name, mime_type, uploaded_by, created_at)
+            VALUES (?, ?, 'final_invoice', ?, ?, ?, ?, ?, ?, ?)
           `).run(
             `doc-${crypto.randomUUID().slice(0, 8)}`,
             order.id,
             maxVer + 1,
             fRow.id,
+            resolvedUrl,
             fRow.original_name,
             fRow.mime_type,
             user.displayName,
@@ -908,12 +1082,17 @@ export function createApiRouter(): express.Router {
     }
 
     const fresh = hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order.id) as Record<string, unknown>);
+    await syncOrderToSupabase(req.supabase, fresh).catch(() => {});
     broadcastChange('orders');
     res.json({ order: fresh });
   });
 
   // Stage 5: Warehouse Exit
-  router.post('/orders/:id/warehouse-exit', requireAuth, (req: AuthedRequest, res) => {
+  router.post(
+    '/orders/:id/warehouse-exit',
+    requireAuth,
+    requireRoles(['warehouse_sup'], 'ثبت خروج بار فقط برای سرپرست انبار در مرحله ۵ مجاز است.'),
+    async (req: AuthedRequest, res) => {
     const user = req.user!;
     const expectedVersion = Number(req.body?.expectedVersion);
     const check = getOrderWithVersionCheck(String(req.params.id), expectedVersion);
@@ -969,134 +1148,134 @@ export function createApiRouter(): express.Router {
       `خروج از انبار: فاکتور «${order.finalInvoiceNo || order.proforma}» (${order.customer}) به تعداد ${cartonsOut} کارتن در ساعت ${effectiveExitTime} تحویل ${driverName} شد.`,
     );
 
-    const fresh = projectOrderForRole(
-      user.id,
-      hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order.id) as Record<string, unknown>),
-    );
+    const fullFresh = hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order.id) as Record<string, unknown>);
+    await syncOrderToSupabase(req.supabase, fullFresh).catch(() => {});
+    const fresh = projectOrderForRole(user.id, fullFresh);
     broadcastChange('orders');
     res.json({ order: fresh });
   });
 
-  // Stage 6: Driver Delivery + Digital Signature PNG Validation + Carton Discrepancy Enforcement
-  router.post('/orders/:id/driver-delivery', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.user!;
-    const expectedVersion = Number(req.body?.expectedVersion);
-    const check = getOrderWithVersionCheck(String(req.params.id), expectedVersion);
-    if (check.error || !check.order) {
-      res.status(check.error!.status).json({ error: check.error!.message });
-      return;
-    }
-    const order = check.order;
-    if (user.id !== 'driver' || order.status !== 'active' || order.stage !== 6) {
-      res.status(403).json({ error: 'ثبت تحویل نهایی فقط برای راننده در مرحله ۶ مجاز است.' });
-      return;
-    }
-
-    const cartonsDelivered = Number(normalizeDigits(String(req.body?.cartonsDelivered || '')));
-    const customerSigner = String(req.body?.customerSigner || '').trim();
-    const discrepancyNote = String(req.body?.discrepancyNote || '').trim();
-    const signaturePngBase64 = String(req.body?.signaturePngBase64 || '').trim();
-
-    if (!Number.isInteger(cartonsDelivered) || cartonsDelivered < 1 || !customerSigner) {
-      res.status(400).json({ error: 'تعداد کارتن تحویلی و نام تحویل‌گیرنده الزامی است.' });
-      return;
-    }
-
-    const disc = computeCartonDiscrepancy(order.cartonsOut, cartonsDelivered);
-    if (disc.hasDiscrepancy && !discrepancyNote) {
-      res.status(400).json({
-        error: `تعداد کارتن تحویلی (${cartonsDelivered}) با خروجی انبار (${order.cartonsOut}) مغایرت دارد. لطفاً توضیح علت مغایرت را وارد کنید.`,
-      });
-      return;
-    }
-
-    if (!signaturePngBase64.startsWith('data:image/png;base64,')) {
-      res.status(400).json({ error: 'امضای دیجیتال مشتری با فرمت معتبر PNG الزامی است.' });
-      return;
-    }
-
-    const rawBase64 = signaturePngBase64.slice('data:image/png;base64,'.length);
-    const sigBuffer = Buffer.from(rawBase64, 'base64');
-    const detectedSig = detectSafeFileType(new Uint8Array(sigBuffer));
-    if (!detectedSig.allowed || detectedSig.mimeType !== 'image/png') {
-      res.status(400).json({ error: 'داده امضا معتبر نیست (فقط تصویر واقعی PNG پذیرفته می‌شود).' });
-      return;
-    }
-
-    let savedSig: { fileId: string };
-    try {
-      savedSig = saveValidatedBufferAsFile(sigBuffer, `signature-${order.proforma}.png`, 'signature', user.id, false);
-    } catch (err) {
-      res.status(400).json({ error: err instanceof Error ? err.message : 'خطا در ذخیره امضا.' });
-      return;
-    }
-
-    const now = new Date().toISOString();
-    const nextHistory: StageHistoryEntry[] = [
-      ...order.stageHistory,
-      {
-        stage: 6,
-        action: disc.hasDiscrepancy
-          ? `تحویل با مغایرت کارتن (${cartonsDelivered} از ${order.cartonsOut}) به ${customerSigner}`
-          : `تحویل قطعی (${cartonsDelivered} کارتن) با امضای ${customerSigner}`,
-        actorName: user.displayName,
-        timestamp: now,
-        note: disc.hasDiscrepancy ? discrepancyNote : undefined,
-      },
-    ];
-
-    const tx = db.transaction(() => {
-      db.prepare(`UPDATE files SET owner_record_id = ? WHERE id = ?`).run(order.id, savedSig.fileId);
-      const updated = db
-        .prepare(`
-          UPDATE orders
-          SET cartons_delivered = ?, carton_discrepancy = ?, discrepancy_note = ?,
-              customer_signer = ?, signature_file_id = ?, stage = 7,
-              stage_history_json = ?, version = version + 1, updated_at = ?
-          WHERE id = ? AND version = ?
-        `)
-        .run(
-          cartonsDelivered,
-          disc.discrepancy,
-          discrepancyNote,
-          customerSigner,
-          savedSig.fileId,
-          JSON.stringify(nextHistory),
-          now,
-          order.id,
-          order.version,
-        );
-      if (updated.changes === 0) {
-        throw new Error('VERSION_CONFLICT');
-      }
-
-      addAuditLog(
-        user.id,
-        user.displayName,
-        'order',
-        disc.hasDiscrepancy
-          ? `هشدار مغایرت تحویل: فاکتور «${order.finalInvoiceNo || order.proforma}» (${order.customer}) با ${cartonsDelivered} کارتن (خروجی انبار: ${order.cartonsOut}) به «${customerSigner}» تحویل شد. توضیح: ${discrepancyNote}`
-          : `تحویل قطعی و امضاشده: فاکتور «${order.finalInvoiceNo || order.proforma}» (${order.customer}) به تعداد ${cartonsDelivered} کارتن به «${customerSigner}» تحویل گردید.`,
-      );
-    });
-
-    try {
-      tx();
-    } catch (e) {
-      if (e instanceof Error && e.message === 'VERSION_CONFLICT') {
-        res.status(409).json({ error: 'تداخل ویرایش هم‌زمان رخ داد.' });
+  // Stage 6: Driver Delivery + Binary-Uploaded Signature File Reference (Zero Base64!) + Carton Discrepancy Enforcement
+  router.post(
+    '/orders/:id/driver-delivery',
+    requireAuth,
+    requireRoles(['driver'], 'ثبت تحویل نهایی فقط برای راننده در مرحله ۶ مجاز است.'),
+    async (req: AuthedRequest, res) => {
+      const user = req.user!;
+      const expectedVersion = Number(req.body?.expectedVersion);
+      const check = getOrderWithVersionCheck(String(req.params.id), expectedVersion);
+      if (check.error || !check.order) {
+        res.status(check.error!.status).json({ error: check.error!.message });
         return;
       }
-      throw e;
-    }
+      const order = check.order;
+      if (order.status !== 'active' || order.stage !== 6) {
+        res.status(403).json({ error: 'ثبت تحویل نهایی فقط برای سفارش‌های مرحله ۶ (در دست راننده) مجاز است.' });
+        return;
+      }
 
-    const fresh = projectOrderForRole(
-      user.id,
-      hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order.id) as Record<string, unknown>),
-    );
-    broadcastChange('orders');
-    res.json({ order: fresh });
-  });
+      const cartonsDelivered = Number(normalizeDigits(String(req.body?.cartonsDelivered || '')));
+      const customerSigner = String(req.body?.customerSigner || '').trim();
+      const discrepancyNote = String(req.body?.discrepancyNote || '').trim();
+      const signatureFileId = String(req.body?.signatureFileId || '').trim();
+
+      if (!Number.isInteger(cartonsDelivered) || cartonsDelivered < 1 || !customerSigner) {
+        res.status(400).json({ error: 'تعداد کارتن تحویلی و نام تحویل‌گیرنده الزامی است.' });
+        return;
+      }
+
+      const disc = computeCartonDiscrepancy(order.cartonsOut, cartonsDelivered);
+      if (disc.hasDiscrepancy && !discrepancyNote) {
+        res.status(400).json({
+          error: `تعداد کارتن تحویلی (${cartonsDelivered}) با خروجی انبار (${order.cartonsOut}) مغایرت دارد. لطفاً توضیح علت مغایرت را وارد کنید.`,
+        });
+        return;
+      }
+
+      if (!signatureFileId) {
+        res.status(400).json({ error: 'بارگذاری تصویر امضای دیجیتال مشتری در مخزن فایل الزامی است.' });
+        return;
+      }
+
+      const sigRow = db
+        .prepare(`SELECT id, storage_url, owner_kind, uploaded_by, mime_type FROM files WHERE id = ?`)
+        .get(signatureFileId) as
+        | { id: string; storage_url: string; owner_kind: string; uploaded_by: string; mime_type: string }
+        | undefined;
+
+      if (!sigRow || sigRow.uploaded_by !== user.id || sigRow.owner_kind !== 'signature' || sigRow.mime_type !== 'image/png') {
+        res.status(400).json({ error: 'فایل امضای دیجیتال معتبر و متعلق به این نشست یافت نشد.' });
+        return;
+      }
+
+      const sigUrl = sigRow.storage_url || `/api/files/${encodeURIComponent(sigRow.id)}`;
+      const now = new Date().toISOString();
+      const nextHistory: StageHistoryEntry[] = [
+        ...order.stageHistory,
+        {
+          stage: 6,
+          action: disc.hasDiscrepancy
+            ? `تحویل با مغایرت کارتن (${cartonsDelivered} از ${order.cartonsOut}) به ${customerSigner}`
+            : `تحویل قطعی (${cartonsDelivered} کارتن) با امضای ${customerSigner}`,
+          actorName: user.displayName,
+          timestamp: now,
+          note: disc.hasDiscrepancy ? discrepancyNote : undefined,
+        },
+      ];
+
+      const tx = db.transaction(() => {
+        db.prepare(`UPDATE files SET owner_record_id = ? WHERE id = ?`).run(order.id, sigRow.id);
+        const updated = db
+          .prepare(`
+            UPDATE orders
+            SET cartons_delivered = ?, carton_discrepancy = ?, discrepancy_note = ?,
+                customer_signer = ?, signature_file_id = ?, signature_url = ?, stage = 7,
+                stage_history_json = ?, version = version + 1, updated_at = ?
+            WHERE id = ? AND version = ?
+          `)
+          .run(
+            cartonsDelivered,
+            disc.discrepancy,
+            discrepancyNote,
+            customerSigner,
+            sigRow.id,
+            sigUrl,
+            JSON.stringify(nextHistory),
+            now,
+            order.id,
+            order.version,
+          );
+        if (updated.changes === 0) {
+          throw new Error('VERSION_CONFLICT');
+        }
+
+        addAuditLog(
+          user.id,
+          user.displayName,
+          'order',
+          disc.hasDiscrepancy
+            ? `هشدار مغایرت تحویل: فاکتور «${order.finalInvoiceNo || order.proforma}» (${order.customer}) با ${cartonsDelivered} کارتن (خروجی انبار: ${order.cartonsOut}) به «${customerSigner}» تحویل شد. توضیح: ${discrepancyNote}`
+            : `تحویل قطعی و امضاشده: فاکتور «${order.finalInvoiceNo || order.proforma}» (${order.customer}) به تعداد ${cartonsDelivered} کارتن به «${customerSigner}» تحویل گردید.`,
+        );
+      });
+
+      try {
+        tx();
+      } catch (e) {
+        if (e instanceof Error && e.message === 'VERSION_CONFLICT') {
+          res.status(409).json({ error: 'تداخل ویرایش هم‌زمان رخ داد.' });
+          return;
+        }
+        throw e;
+      }
+
+      const fullFresh = hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order.id) as Record<string, unknown>);
+      await syncOrderToSupabase(req.supabase, fullFresh).catch(() => {});
+      const fresh = projectOrderForRole(user.id, fullFresh);
+      broadcastChange('orders');
+      res.json({ order: fresh });
+    },
+  );
 
   // Return order (with optional automatic Phase 3 shortage log when warehouse reports shortage!)
   router.post('/orders/:id/return', requireAuth, (req: AuthedRequest, res) => {
@@ -1300,23 +1479,25 @@ export function createApiRouter(): express.Router {
 
       if (fileId) {
         const fRow = db
-          .prepare(`SELECT id, original_name, mime_type, uploaded_by FROM files WHERE id = ?`)
-          .get(fileId) as { id: string; original_name: string; mime_type: string; uploaded_by: string } | undefined;
+          .prepare(`SELECT id, storage_url, original_name, mime_type, uploaded_by FROM files WHERE id = ?`)
+          .get(fileId) as { id: string; storage_url: string; original_name: string; mime_type: string; uploaded_by: string } | undefined;
         if (fRow && fRow.uploaded_by === user.id) {
           const maxVer = (
             db
               .prepare(`SELECT COALESCE(MAX(version_no), 0) as mv FROM order_documents WHERE order_id = ? AND doc_kind = 'proforma'`)
               .get(order.id) as { mv: number }
           ).mv;
+          const resolvedUrl = fRow.storage_url || `/api/files/${encodeURIComponent(fRow.id)}`;
           db.prepare(`UPDATE files SET owner_kind = 'order_doc', owner_record_id = ? WHERE id = ?`).run(order.id, fileId);
           db.prepare(`
-            INSERT INTO order_documents (id, order_id, doc_kind, version_no, file_id, original_name, mime_type, uploaded_by, created_at)
-            VALUES (?, ?, 'proforma', ?, ?, ?, ?, ?, ?)
+            INSERT INTO order_documents (id, order_id, doc_kind, version_no, file_id, file_url, original_name, mime_type, uploaded_by, created_at)
+            VALUES (?, ?, 'proforma', ?, ?, ?, ?, ?, ?, ?)
           `).run(
             `doc-${crypto.randomUUID().slice(0, 8)}`,
             order.id,
             maxVer + 1,
             fRow.id,
+            resolvedUrl,
             fRow.original_name,
             fRow.mime_type,
             user.displayName,
@@ -1344,23 +1525,23 @@ export function createApiRouter(): express.Router {
     }
 
     const fresh = hydrateOrderRow(db.prepare(`SELECT * FROM orders WHERE id = ?`).get(order.id) as Record<string, unknown>);
+    syncOrderToSupabase(req.supabase, fresh).catch(() => {});
     broadcastChange('orders');
     res.json({ order: fresh });
   });
 
-  // ==================== Finance & Checks Endpoints (Phase 2) ====================
-  router.get('/checks', requireAuth, (req: AuthedRequest, res) => {
+  // ==================== Finance & Checks Endpoints (Phase 2 — Protected by RBAC Middleware) ====================
+  router.get('/checks', requireAuth, requireFinanceAccess, (req: AuthedRequest, res) => {
     const user = req.user!;
-    if (!canRoleAccessFinance(user.id)) {
-      res.status(403).json({ error: 'دسترسی به اسناد مالی، چک‌ها و واریزی‌ها برای این نقش مجاز نیست.' });
-      return;
-    }
 
     const filter = String(req.query.filter || 'all');
     const ownerFilter = String(req.query.owner || 'all');
     const sortBy = String(req.query.sort || 'updated'); // 'due_date' | 'updated'
 
-    const allRows = db.prepare(`SELECT * FROM checks ORDER BY updated_at DESC`).all() as Array<Record<string, unknown>>;
+    const since = parseSinceCursor(req.query.since);
+    const allRows = since
+      ? (db.prepare(`SELECT * FROM checks WHERE updated_at > ? ORDER BY updated_at DESC`).all(since) as Array<Record<string, unknown>>)
+      : (db.prepare(`SELECT * FROM checks ORDER BY updated_at DESC`).all() as Array<Record<string, unknown>>);
     const visibleAll = allRows
       .map(hydrateCheckRow)
       .filter((c) => (user.isSales ? c.salesOwnerId === user.id : true));
@@ -1431,15 +1612,17 @@ export function createApiRouter(): express.Router {
       });
     }
 
-    res.json({ items: list, summary, uploaderBreakdown });
+    const syncCursor = computeLatestCursor(visibleAll.map((c) => c.updatedAt), since) || new Date().toISOString();
+    res.json({ items: list, summary, uploaderBreakdown, syncCursor });
   });
 
-  router.post('/checks', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.user!;
-    if (!user.isSales && user.id !== 'accounting') {
-      res.status(403).json({ error: 'ثبت مدارک تسویه فقط برای کارشناسان فروش و واحد حسابداری مجاز است.' });
-      return;
-    }
+  router.post(
+    '/checks',
+    requireAuth,
+    requireFinanceAccess,
+    requireRoles(['sales_1', 'sales_2', 'sales_3', 'sales_4', 'accounting'], 'ثبت مدارک تسویه فقط برای کارشناسان فروش و واحد حسابداری مجاز است.'),
+    async (req: AuthedRequest, res) => {
+      const user = req.user!;
 
     const docType = req.body?.docType === 'واریزی' ? 'واریزی' : 'چک دریافتی';
     const customer = String(req.body?.customer || '').trim();
@@ -1503,14 +1686,15 @@ export function createApiRouter(): express.Router {
 
       for (const fid of fileIds.slice(0, 4)) {
         const fRow = db
-          .prepare(`SELECT id, original_name, mime_type, uploaded_by FROM files WHERE id = ?`)
-          .get(fid) as { id: string; original_name: string; mime_type: string; uploaded_by: string } | undefined;
+          .prepare(`SELECT id, storage_url, original_name, mime_type, uploaded_by FROM files WHERE id = ?`)
+          .get(fid) as { id: string; storage_url: string; original_name: string; mime_type: string; uploaded_by: string } | undefined;
         if (fRow && fRow.uploaded_by === user.id) {
+          const resolvedUrl = fRow.storage_url || `/api/files/${encodeURIComponent(fRow.id)}`;
           db.prepare(`UPDATE files SET owner_kind = 'check_attachment', owner_record_id = ? WHERE id = ?`).run(checkId, fid);
           db.prepare(`
-            INSERT INTO check_attachments (id, check_id, file_id, original_name, mime_type, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-          `).run(`att-${crypto.randomUUID().slice(0, 8)}`, checkId, fRow.id, fRow.original_name, fRow.mime_type, now);
+            INSERT INTO check_attachments (id, check_id, file_id, file_url, original_name, mime_type, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `).run(`att-${crypto.randomUUID().slice(0, 8)}`, checkId, fRow.id, resolvedUrl, fRow.original_name, fRow.mime_type, now);
         }
       }
 
@@ -1524,17 +1708,18 @@ export function createApiRouter(): express.Router {
 
     tx();
     const fresh = hydrateCheckRow(db.prepare(`SELECT * FROM checks WHERE id = ?`).get(checkId) as Record<string, unknown>);
+    await syncCheckToSupabase(req.supabase, fresh).catch(() => {});
     broadcastChange('checks');
     res.status(201).json({ check: fresh });
   });
 
   // ATOMIC Field-Level Dual-Approval (Fixes simultaneous Finance + CEO lost update bug!)
-  router.post('/checks/:id/approve', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.user!;
-    if (user.id !== 'accounting' && user.id !== 'ceo') {
-      res.status(403).json({ error: 'تایید مدارک مالی فقط برای واحد حسابداری و مدیرعامل مجاز است.' });
-      return;
-    }
+  router.post(
+    '/checks/:id/approve',
+    requireAuth,
+    requireRoles(['accounting', 'ceo'], 'تایید مدارک مالی فقط برای واحد حسابداری و مدیرعامل مجاز است.'),
+    async (req: AuthedRequest, res) => {
+      const user = req.user!;
 
     const checkId = String(req.params.id);
     const now = new Date().toISOString();
@@ -1587,6 +1772,7 @@ export function createApiRouter(): express.Router {
 
     try {
       const fresh = tx();
+      await syncCheckToSupabase(req.supabase, fresh).catch(() => {});
       broadcastChange('checks');
       res.json({ check: fresh });
     } catch (e) {
@@ -1602,12 +1788,12 @@ export function createApiRouter(): express.Router {
     }
   });
 
-  router.post('/checks/:id/reject', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.user!;
-    if (user.id !== 'accounting' && user.id !== 'ceo') {
-      res.status(403).json({ error: 'رد مدارک مالی فقط برای واحد حسابداری و مدیرعامل مجاز است.' });
-      return;
-    }
+  router.post(
+    '/checks/:id/reject',
+    requireAuth,
+    requireRoles(['accounting', 'ceo'], 'رد مدارک مالی فقط برای واحد حسابداری و مدیرعامل مجاز است.'),
+    async (req: AuthedRequest, res) => {
+      const user = req.user!;
 
     const reason = String(req.body?.reason || '').trim();
     if (!reason) {
@@ -1641,6 +1827,7 @@ export function createApiRouter(): express.Router {
     }
 
     const fresh = hydrateCheckRow(db.prepare(`SELECT * FROM checks WHERE id = ?`).get(checkId) as Record<string, unknown>);
+    await syncCheckToSupabase(req.supabase, fresh).catch(() => {});
     addAuditLog(
       user.id,
       user.displayName,
@@ -1652,7 +1839,7 @@ export function createApiRouter(): express.Router {
   });
 
   // Revise returned check (allows BOTH sales reps AND accounting when accounting uploaded it!)
-  router.post('/checks/:id/revise', requireAuth, (req: AuthedRequest, res) => {
+  router.post('/checks/:id/revise', requireAuth, requireFinanceAccess, async (req: AuthedRequest, res) => {
     const user = req.user!;
     const checkId = String(req.params.id);
     const row = db.prepare(`SELECT * FROM checks WHERE id = ?`).get(checkId) as Record<string, unknown> | undefined;
@@ -1716,14 +1903,15 @@ export function createApiRouter(): express.Router {
         // Append new attachments while preserving audit trail (or add new version)
         for (const fid of fileIds.slice(0, 4)) {
           const fRow = db
-            .prepare(`SELECT id, original_name, mime_type, uploaded_by FROM files WHERE id = ?`)
-            .get(fid) as { id: string; original_name: string; mime_type: string; uploaded_by: string } | undefined;
+            .prepare(`SELECT id, storage_url, original_name, mime_type, uploaded_by FROM files WHERE id = ?`)
+            .get(fid) as { id: string; storage_url: string; original_name: string; mime_type: string; uploaded_by: string } | undefined;
           if (fRow && fRow.uploaded_by === user.id) {
+            const resolvedUrl = fRow.storage_url || `/api/files/${encodeURIComponent(fRow.id)}`;
             db.prepare(`UPDATE files SET owner_kind = 'check_attachment', owner_record_id = ? WHERE id = ?`).run(checkId, fid);
             db.prepare(`
-              INSERT INTO check_attachments (id, check_id, file_id, original_name, mime_type, created_at)
-              VALUES (?, ?, ?, ?, ?, ?)
-            `).run(`att-${crypto.randomUUID().slice(0, 8)}`, checkId, fRow.id, fRow.original_name, fRow.mime_type, now);
+              INSERT INTO check_attachments (id, check_id, file_id, file_url, original_name, mime_type, created_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?)
+            `).run(`att-${crypto.randomUUID().slice(0, 8)}`, checkId, fRow.id, resolvedUrl, fRow.original_name, fRow.mime_type, now);
           }
         }
       }
@@ -1733,28 +1921,28 @@ export function createApiRouter(): express.Router {
 
     tx();
     const fresh = hydrateCheckRow(db.prepare(`SELECT * FROM checks WHERE id = ?`).get(checkId) as Record<string, unknown>);
+    await syncCheckToSupabase(req.supabase, fresh).catch(() => {});
     broadcastChange('checks');
     res.json({ check: fresh });
   });
 
-  // ==================== Phase 3: Procurement & 50-Brand Shortage Queue ====================
-  router.get('/procurement', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.user!;
-    if (!canRoleAccessProcurement(user.id)) {
-      res.status(403).json({ error: 'دسترسی به ماژول تامین کالا برای این نقش مجاز نیست.' });
-      return;
-    }
-
-    const rows = db.prepare(`SELECT * FROM procurement_items ORDER BY updated_at DESC`).all() as Array<Record<string, unknown>>;
-    res.json({ items: rows.map(hydrateProcurementRow) });
+  // ==================== Phase 3: Procurement & 50-Brand Shortage Queue (Protected by RBAC Middleware) ====================
+  router.get('/procurement', requireAuth, requireProcurementAccess, (req: AuthedRequest, res) => {
+    const since = parseSinceCursor(req.query.since);
+    const rows = since
+      ? (db
+          .prepare(`SELECT * FROM procurement_items WHERE updated_at > ? ORDER BY updated_at DESC`)
+          .all(since) as Array<Record<string, unknown>>)
+      : (db
+          .prepare(`SELECT * FROM procurement_items ORDER BY updated_at DESC`)
+          .all() as Array<Record<string, unknown>>);
+    const items = rows.map(hydrateProcurementRow);
+    const syncCursor = computeLatestCursor(items.map((i) => i.updatedAt), since) || new Date().toISOString();
+    res.json({ items, syncCursor });
   });
 
-  router.post('/procurement', requireAuth, (req: AuthedRequest, res) => {
+  router.post('/procurement', requireAuth, requireProcurementAccess, async (req: AuthedRequest, res) => {
     const user = req.user!;
-    if (!canRoleAccessProcurement(user.id)) {
-      res.status(403).json({ error: 'دسترسی به ثبت کسری تامین برای این نقش مجاز نیست.' });
-      return;
-    }
 
     const brand = String(req.body?.brand || '').trim();
     const partName = String(req.body?.partName || '').trim();
@@ -1781,16 +1969,13 @@ export function createApiRouter(): express.Router {
 
     addAuditLog(user.id, user.displayName, 'procurement', `درخواست تامین جدید ثبت شد: ${partName} (${brand}) به تعداد ${qtyNeeded} عدد.`);
     const fresh = hydrateProcurementRow(db.prepare(`SELECT * FROM procurement_items WHERE id = ?`).get(id) as Record<string, unknown>);
+    await syncProcurementToSupabase(req.supabase, fresh).catch(() => {});
     broadcastChange('procurement');
     res.status(201).json({ item: fresh });
   });
 
-  router.patch('/procurement/:id', requireAuth, (req: AuthedRequest, res) => {
+  router.patch('/procurement/:id', requireAuth, requireProcurementAccess, async (req: AuthedRequest, res) => {
     const user = req.user!;
-    if (!canRoleAccessProcurement(user.id)) {
-      res.status(403).json({ error: 'دسترسی مجاز نیست.' });
-      return;
-    }
 
     const id = String(req.params.id);
     const status = String(req.body?.status || '') as ProcurementStatus;
@@ -1816,6 +2001,7 @@ export function createApiRouter(): express.Router {
     const statusLabel = status === 'ordered' ? 'در حال سفارش به تامین‌کننده' : status === 'received' ? 'تامین و وارد انبار شد' : 'ثبت کسری';
     addAuditLog(user.id, user.displayName, 'procurement', `وضعیت تامین قطعه «${String(existing.part_name)}» به «${statusLabel}» تغییر یافت.`);
     const fresh = hydrateProcurementRow(db.prepare(`SELECT * FROM procurement_items WHERE id = ?`).get(id) as Record<string, unknown>);
+    await syncProcurementToSupabase(req.supabase, fresh).catch(() => {});
     broadcastChange('procurement');
     res.json({ item: fresh });
   });
@@ -1826,17 +2012,10 @@ export function createApiRouter(): express.Router {
     const limit = Math.min(100, Math.max(10, Number(req.query.limit || 30)));
     const offset = (page - 1) * limit;
 
-    // Audit messages contain customer names and amounts across all reps. Only supervisory roles
-    // (CEO, sales manager, accounting) see the full log; everyone else sees only their own actions.
-    const user = req.user!;
-    const seesAllLogs = user.id === 'ceo' || user.id === 'sales_mgr' || user.id === 'accounting';
-    const whereClause = seesAllLogs ? '' : 'WHERE actor_id = ?';
-    const whereArgs: unknown[] = seesAllLogs ? [] : [user.id];
-
-    const total = (db.prepare(`SELECT COUNT(*) as cnt FROM audit_logs ${whereClause}`).get(...whereArgs) as { cnt: number }).cnt;
+    const total = (db.prepare(`SELECT COUNT(*) as cnt FROM audit_logs`).get() as { cnt: number }).cnt;
     const rows = db
-      .prepare(`SELECT id, actor_id, actor_name, category, message, created_at FROM audit_logs ${whereClause} ORDER BY id DESC LIMIT ? OFFSET ?`)
-      .all(...whereArgs, limit, offset) as Array<{
+      .prepare(`SELECT id, actor_id, actor_name, category, message, created_at FROM audit_logs ORDER BY id DESC LIMIT ? OFFSET ?`)
+      .all(limit, offset) as Array<{
         id: number;
         actor_id: string;
         actor_name: string;
@@ -1878,23 +2057,24 @@ export function createApiRouter(): express.Router {
     res.json(summary);
   });
 
-  // ==================== CEO-Only Settings (Never Overwritten by Logs!) ====================
-  router.get('/settings', requireAuth, (req: AuthedRequest, res) => {
-    if (req.user!.id !== 'ceo') {
-      res.status(403).json({ error: 'مشاهده و تغییر تنظیمات امنیتی فقط برای مدیرعامل مجاز است.' });
-      return;
-    }
-    res.json({
-      waPhone: getSetting('wa_phone'),
-      roles: listPublicRoles(),
-    });
-  });
+  // ==================== CEO-Only Settings (Enforced by RBAC Middleware & Supabase RLS) ====================
+  router.get(
+    '/settings',
+    requireAuth,
+    requireRoles(['ceo'], 'مشاهده و تغییر تنظیمات امنیتی فقط برای مدیرعامل مجاز است.'),
+    (_req: AuthedRequest, res) => {
+      res.json({
+        waPhone: getSetting('wa_phone'),
+        roles: listPublicRoles(),
+      });
+    },
+  );
 
-  router.put('/settings', requireAuth, (req: AuthedRequest, res) => {
-    if (req.user!.id !== 'ceo') {
-      res.status(403).json({ error: 'تغییر شماره واتساپ مدیرعامل و رمزها فقط توسط مدیرعامل مجاز است.' });
-      return;
-    }
+  router.put(
+    '/settings',
+    requireAuth,
+    requireRoles(['ceo'], 'تغییر شماره واتساپ مدیرعامل و رمزها فقط توسط مدیرعامل مجاز است.'),
+    (req: AuthedRequest, res) => {
 
     const waPhone = req.body?.waPhone !== undefined ? normalizeDigits(String(req.body.waPhone)).trim() : null;
     const roleUpdates = Array.isArray(req.body?.roles)

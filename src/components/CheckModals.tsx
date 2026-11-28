@@ -25,7 +25,7 @@ export function CheckImageModal({ check, attachment, onClose }: CheckImageModalP
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={() => api.downloadFile(attachment.fileId, attachment.originalName)}
+              onClick={() => api.downloadFile(attachment.fileId, attachment.originalName, attachment.fileUrl)}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 text-xs font-bold text-slate-800 hover:bg-slate-50 cursor-pointer"
             >
               <Download className="w-3.5 h-3.5" />
@@ -64,6 +64,7 @@ export function CheckImageModal({ check, attachment, onClose }: CheckImageModalP
           <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-center">
             <AuthenticatedImage
               fileId={attachment.fileId}
+              fileUrl={attachment.fileUrl}
               alt={attachment.originalName}
               className="max-w-full max-h-[60vh] mx-auto rounded object-contain"
             />

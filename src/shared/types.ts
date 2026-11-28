@@ -42,6 +42,7 @@ export interface OrderDocumentRecord {
   docKind: 'proforma' | 'final_invoice';
   versionNo: number;
   fileId: string;
+  fileUrl: string;
   originalName: string;
   mimeType: string;
   uploadedBy: string;
@@ -83,6 +84,7 @@ export interface OrderRecord {
   discrepancyNote: string;
   customerSigner: string;
   signatureFileId: string | null;
+  signatureUrl: string | null;
   stageHistory: StageHistoryEntry[];
   documents: OrderDocumentRecord[];
   createdAt: string;
@@ -97,6 +99,7 @@ export interface CheckAttachmentRecord {
   id: string;
   checkId: string;
   fileId: string;
+  fileUrl: string;
   originalName: string;
   mimeType: string;
   createdAt: string;
@@ -152,6 +155,18 @@ export interface AuditLogEntry {
   category: 'order' | 'finance' | 'procurement' | 'security' | 'settings';
   message: string;
   createdAt: string;
+}
+
+export interface IncrementalSyncResponse {
+  cursor: string;
+  serverTime: string;
+  since: string | null;
+  isIncremental: boolean;
+  source: 'supabase' | 'local';
+  changedCount: number;
+  orders: OrderRecord[];
+  checks: CheckRecord[];
+  procurement: ProcurementItem[];
 }
 
 export const ROLE_DEFINITIONS: RoleDefinition[] = [

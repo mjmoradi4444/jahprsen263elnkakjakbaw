@@ -3,29 +3,30 @@ import { api } from '../api/client';
 
 interface AuthenticatedImageProps {
   fileId: string;
+  fileUrl?: string | null;
   alt: string;
   className?: string;
 }
 
-export function AuthenticatedImage({ fileId, alt, className }: AuthenticatedImageProps) {
+export function AuthenticatedImage({ fileId, fileUrl, alt, className }: AuthenticatedImageProps) {
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
     let active = true;
-    let createdUrl: string | null = null;
+    let revocableUrl: string | null = null;
     setFailed(false);
     setSrc(null);
 
     api
-      .fetchFileBlobUrl(fileId)
-      .then(({ blobUrl }) => {
+      .resolveFileDisplayUrl(fileId, fileUrl)
+      .then(({ url, revoke }) => {
         if (!active) {
-          URL.revokeObjectURL(blobUrl);
+          if (revoke) URL.revokeObjectURL(url);
           return;
         }
-        createdUrl = blobUrl;
-        setSrc(blobUrl);
+        if (revoke) revocableUrl = url;
+        setSrc(url);
       })
       .catch(() => {
         if (active) setFailed(true);
@@ -33,9 +34,9 @@ export function AuthenticatedImage({ fileId, alt, className }: AuthenticatedImag
 
     return () => {
       active = false;
-      if (createdUrl) URL.revokeObjectURL(createdUrl);
+      if (revocableUrl) URL.revokeObjectURL(revocableUrl);
     };
-  }, [fileId]);
+  }, [fileId, fileUrl]);
 
   if (failed) {
     return (
