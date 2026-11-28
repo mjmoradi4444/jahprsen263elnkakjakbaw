@@ -2609,7 +2609,12 @@ export function createApiRouter(): express.Router {
       await writeBackup(res);
       addAuditLog(req.user!.id, req.user!.displayName, 'admin', 'مدیرعامل نسخه پشتیبان کامل را دانلود کرد.');
     } catch (err) {
-      console.error('[Backup] Download failed:', err instanceof Error ? err.message : err);
+      const code = (err as { code?: string })?.code;
+      if (code === 'ERR_STREAM_PREMATURE_CLOSE' || res.destroyed) {
+        console.warn('[Backup] Download was cancelled by the browser before it finished.');
+      } else {
+        console.error('[Backup] Download failed:', err instanceof Error ? err.message : err);
+      }
       if (!res.headersSent) res.status(500).json({ error: 'ساخت نسخه پشتیبان با خطا مواجه شد.' });
       else res.destroy();
     }

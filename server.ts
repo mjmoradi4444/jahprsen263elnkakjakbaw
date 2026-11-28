@@ -14,6 +14,18 @@ if (process.argv.includes('--production')) {
   process.env.NODE_ENV = 'production';
 }
 
+// Safety net: a stray async error in one request (e.g. a client disconnecting mid-download) must be
+// logged, never take the whole portal down for everyone. Data writes are transactional, so
+// continuing is safe.
+process.on('unhandledRejection', (reason) => {
+  const code = (reason as { code?: string })?.code;
+  if (code === 'ERR_STREAM_PREMATURE_CLOSE') {
+    console.warn('[Server] A download was cancelled by the browser.');
+    return;
+  }
+  console.error('[Server] Unhandled async error (server keeps running):', reason);
+});
+
 async function startServer(): Promise<void> {
   // If the disk was wiped (host without persistent storage), pull data back from Supabase first.
   await restoreFromSupabaseIfEmpty();

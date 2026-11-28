@@ -321,7 +321,11 @@ async function getOcrWorker(): Promise<TesseractWorker> {
         langPath: engDir,
         cachePath: path.join(path.resolve(process.env.DATA_DIR || path.join(process.cwd(), 'data')), 'ocr-cache'),
         gzip: true,
-      });
+      },
+      // Send the engine's internal debug statistics ("Total count= ... Median= ...") nowhere,
+      // so the server window only shows real messages. (/dev/null is inside the engine's own
+      // virtual file system, so this works on Windows too.)
+      { debug_file: '/dev/null' } as unknown as Partial<import('tesseract.js').InitOptions>);
       await worker.setParameters({
         tessedit_char_whitelist: '0123456789/()',
         tessedit_pageseg_mode: PSM.SINGLE_LINE,

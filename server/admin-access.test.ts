@@ -253,3 +253,44 @@ test('backup -> change -> restore brings back the exact earlier state', async ()
   const old = (await (await call('GET', '/admin/reports/summary?from=2020-01-01&to=2020-02-01', tokens.ceo)).json()).report;
   assert.equal(old.orders.created, 0);
 });
+
+test('cancelling a backup download midway does not crash the server', async () => {
+  const crypto = await import('node:crypto');
+  // Make the backup large enough that it is still streaming when the browser goes away.
+  for (let i = 0; i < 3; i++) {
+    const fd = new FormData();
+    fd.append('kind', 'order_doc');
+    const body = Buffer.concat([Buffer.from('%PDF-1.4\n'), crypto.randomBytes(4 * 1024 * 1024)]);
+    fd.append('file', new Blob([body], { type: 'application/pdf' }), `big-${i}.pdf`);
+    const up = await call('POST', '/files', tokens.sales_1, fd);
+    assert.equal(up.status, 201);
+  }
+  let unhandled: unknown = null;
+  const onUnhandled = (r: unknown) => {
+    unhandled = r;
+  };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    for (let i = 0; i < 3; i++) {
+      const ac = new AbortController();
+      const res = await fetch(`${base}/admin/backups/full`, {
+        headers: { Authorization: `Bearer ${tokens.ceo}` },
+        signal: ac.signal,
+      });
+      assert.equal(res.status, 200);
+      const reader = res.body!.getReader();
+      await reader.read();
+      ac.abort();
+      await reader.cancel().catch(() => {});
+    }
+    await new Promise((r) => setTimeout(r, 800));
+    assert.equal(unhandled, null, `unhandled rejection: ${String(unhandled)}`);
+    // Server still answers, and a full download still works afterwards.
+    const b = await call('GET', '/admin/backups/full', tokens.ceo);
+    assert.equal(b.status, 200);
+    const zip = Buffer.from(await b.arrayBuffer());
+    assert.ok(zip.length > 12 * 1024 * 1024);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});

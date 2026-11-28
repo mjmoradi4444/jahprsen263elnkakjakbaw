@@ -123,25 +123,42 @@ export async function writeBackup(output: Writable): Promise<BackupManifest> {
     snapshot.close();
 
     const archive = new ZipArchive({ zlib: { level: 6 } });
+    // The pipeline is observed from the start: if the receiver goes away (browser cancelled the
+    // download, connection dropped), its rejection must never be left unhandled — that used to
+    // crash the whole server. Every later step races against it so the backup stops at once.
     const done = pipeline(archive, output);
+    let aborted: Error | null = null;
+    const abortSignal = done.then(
+      () => new Promise<never>(() => {}),
+      (err: Error) => {
+        aborted = err;
+        archive.abort();
+        throw err;
+      },
+    );
+    abortSignal.catch(() => {});
+    const step = <T>(p: Promise<T>): Promise<T> => {
+      if (aborted) return Promise.reject(aborted);
+      return Promise.race([p, abortSignal]);
+    };
 
-    await appendAndWait(archive, fs.createReadStream(snapshotPath), 'database.sqlite');
+    await step(appendAndWait(archive, fs.createReadStream(snapshotPath), 'database.sqlite'));
 
     const missingFiles: string[] = [];
     let fileCount = 0;
     for (const f of fileRows) {
       if (!FILE_ID_RE.test(f.id)) continue;
-      const stored = await fetchFileFromStorage({
+      const stored = await step(fetchFileFromStorage({
         storageProvider: f.storage_provider,
         storageBucket: f.storage_bucket,
         storagePath: f.storage_path,
         storedFilename: f.stored_filename,
-      }).catch(() => null);
+      }).catch(() => null));
       if (!stored) {
         missingFiles.push(f.id);
         continue;
       }
-      await appendAndWait(archive, stored.stream as Readable, `files/${f.id}`);
+      await step(appendAndWait(archive, stored.stream as Readable, `files/${f.id}`));
       fileCount++;
     }
 
@@ -153,8 +170,8 @@ export async function writeBackup(output: Writable): Promise<BackupManifest> {
       files: fileCount,
       missingFiles,
     };
-    await appendAndWait(archive, JSON.stringify(manifest, null, 2), 'manifest.json');
-    await archive.finalize();
+    await step(appendAndWait(archive, JSON.stringify(manifest, null, 2), 'manifest.json'));
+    await step(archive.finalize());
     await done;
     return manifest;
   } finally {
