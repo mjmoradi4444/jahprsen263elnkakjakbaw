@@ -63,7 +63,9 @@ export function ChartCard({
   table,
   children,
   legend,
+  className,
 }: {
+  className?: string;
   title: string;
   subtitle?: string;
   table?: React.ReactNode;
@@ -72,7 +74,7 @@ export function ChartCard({
 }) {
   const [showTable, setShowTable] = useState(false);
   return (
-    <section className="bg-white border border-slate-200 rounded-xl p-4 min-w-0">
+    <section className={`bg-white border border-slate-200 rounded-xl p-4 min-w-0 ${className || ''}`}>
       <div className="flex items-start justify-between gap-3 mb-3">
         <div className="min-w-0">
           <h2 className="text-sm font-extrabold text-slate-900">{title}</h2>

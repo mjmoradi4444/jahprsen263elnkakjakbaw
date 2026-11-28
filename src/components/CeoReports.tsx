@@ -308,9 +308,63 @@ export function CeoReports({ onNotify, refreshTrigger }: CeoReportsProps) {
             </ChartCard>
           </div>
 
+          {/* Order channel and payment terms: two separate charts (each order counted once in each) */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <ChartCard
+              title="کانال دریافت سفارش"
+              subtitle="مبلغ پیش‌فاکتورهای ثبت‌شده در این بازه؛ هر سفارش فقط یک بار شمرده می‌شود"
+              table={
+                <DataTable
+                  columns={[
+                    { key: 'l', label: 'کانال' },
+                    { key: 'n', label: 'تعداد سفارش', numeric: true },
+                    { key: 'a', label: 'مبلغ', numeric: true },
+                  ]}
+                  rows={report.byChannel.map((x) => ({ l: x.label, n: fa.format(x.count), a: fullToman(x.amountToman) }))}
+                />
+              }
+            >
+              {report.byChannel.length === 0 ? (
+                <p className="text-xs text-slate-500">سفارشی در این بازه ثبت نشده است.</p>
+              ) : (
+                <HBarChart
+                  ariaLabel="مبلغ سفارش‌ها به تفکیک کانال دریافت"
+                  series={[{ label: 'مبلغ', color: CHART.series1 }]}
+                  rows={report.byChannel.map((x) => ({ label: x.label, sub: `${fa.format(x.count)} سفارش`, values: [x.amountToman] }))}
+                />
+              )}
+            </ChartCard>
+
+            <ChartCard
+              title="شرایط تسویه"
+              subtitle="مبلغ پیش‌فاکتورهای ثبت‌شده در این بازه؛ هر سفارش فقط یک بار شمرده می‌شود"
+              table={
+                <DataTable
+                  columns={[
+                    { key: 'l', label: 'شرایط تسویه' },
+                    { key: 'n', label: 'تعداد سفارش', numeric: true },
+                    { key: 'a', label: 'مبلغ', numeric: true },
+                  ]}
+                  rows={report.byPayment.map((x) => ({ l: x.label, n: fa.format(x.count), a: fullToman(x.amountToman) }))}
+                />
+              }
+            >
+              {report.byPayment.length === 0 ? (
+                <p className="text-xs text-slate-500">سفارشی در این بازه ثبت نشده است.</p>
+              ) : (
+                <HBarChart
+                  ariaLabel="مبلغ سفارش‌ها به تفکیک شرایط تسویه"
+                  series={[{ label: 'مبلغ', color: CHART.series1 }]}
+                  rows={report.byPayment.map((x) => ({ label: x.label, sub: `${fa.format(x.count)} سفارش`, values: [x.amountToman] }))}
+                />
+              )}
+            </ChartCard>
+          </div>
+
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             {/* Checks status */}
             <ChartCard
+              className={o.returnReasons.length > 0 ? undefined : 'lg:col-span-2'}
               title="وضعیت چک‌ها و واریزی‌ها"
               subtitle={`ثبت‌شده در این بازه: ${fa.format(c.submitted)} سند، ${compactToman(c.amountSubmittedToman)}`}
               table={
@@ -355,38 +409,16 @@ export function CeoReports({ onNotify, refreshTrigger }: CeoReportsProps) {
               </div>
             </ChartCard>
 
-            {/* Channels & payment */}
-            <ChartCard
-              title="کانال سفارش و شرایط تسویه"
-              subtitle="مبلغ پیش‌فاکتورهای ثبت‌شده در این بازه"
-              table={
-                <DataTable
-                  columns={[
-                    { key: 'g', label: 'گروه' },
-                    { key: 'l', label: 'عنوان' },
-                    { key: 'n', label: 'تعداد', numeric: true },
-                    { key: 'a', label: 'مبلغ', numeric: true },
-                  ]}
-                  rows={[
-                    ...report.byChannel.map((x) => ({ g: 'کانال', l: x.label, n: fa.format(x.count), a: fullToman(x.amountToman) })),
-                    ...report.byPayment.map((x) => ({ g: 'تسویه', l: x.label, n: fa.format(x.count), a: fullToman(x.amountToman) })),
-                  ]}
+            {o.returnReasons.length > 0 && (
+              <ChartCard title="علت‌های برگشت سفارش" subtitle="در این بازه (تعداد)">
+                <HBarChart
+                  ariaLabel="تعداد برگشت به تفکیک علت"
+                  format={(n) => fa.format(n)}
+                  series={[{ label: 'تعداد', color: CHART.series1 }]}
+                  rows={o.returnReasons.map((r) => ({ label: r.reason, values: [r.count] }))}
                 />
-              }
-            >
-              <h3 className="text-xs font-bold text-slate-800 mb-2">کانال دریافت سفارش</h3>
-              <HBarChart
-                ariaLabel="مبلغ سفارش‌ها به تفکیک کانال"
-                series={[{ label: 'مبلغ', color: CHART.series1 }]}
-                rows={report.byChannel.map((x) => ({ label: x.label, sub: `${fa.format(x.count)} سفارش`, values: [x.amountToman] }))}
-              />
-              <h3 className="text-xs font-bold text-slate-800 mt-4 mb-2">شرایط تسویه</h3>
-              <HBarChart
-                ariaLabel="مبلغ سفارش‌ها به تفکیک شرایط تسویه"
-                series={[{ label: 'مبلغ', color: CHART.series1 }]}
-                rows={report.byPayment.map((x) => ({ label: x.label, sub: `${fa.format(x.count)} سفارش`, values: [x.amountToman] }))}
-              />
-            </ChartCard>
+              </ChartCard>
+            )}
           </div>
 
           {/* Tables */}
@@ -440,17 +472,6 @@ export function CeoReports({ onNotify, refreshTrigger }: CeoReportsProps) {
               )}
             </section>
           </div>
-
-          {o.returnReasons.length > 0 && (
-            <ChartCard title="علت‌های برگشت سفارش" subtitle="در این بازه (تعداد)">
-              <HBarChart
-                ariaLabel="تعداد برگشت به تفکیک علت"
-                format={(n) => fa.format(n)}
-                series={[{ label: 'تعداد', color: CHART.series1 }]}
-                rows={o.returnReasons.map((r) => ({ label: r.reason, values: [r.count] }))}
-              />
-            </ChartCard>
-          )}
 
           <p className="text-[11px] text-slate-500">
             اقلام کسری باز در واحد تامین: {fa.format(report.procurement.open)}
