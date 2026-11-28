@@ -7,6 +7,12 @@ import { mirrorUsersAndSettingsToSupabase, restoreFromSupabaseIfEmpty } from './
 
 const PORT = Number(process.env.PORT || 3000);
 
+// `npm start` passes --production so production mode works the same on Linux hosts and Windows
+// (setting NODE_ENV inline in an npm script does not work in the Windows shell).
+if (process.argv.includes('--production')) {
+  process.env.NODE_ENV = 'production';
+}
+
 async function startServer(): Promise<void> {
   // If the disk was wiped (host without persistent storage), pull data back from Supabase first.
   await restoreFromSupabaseIfEmpty();

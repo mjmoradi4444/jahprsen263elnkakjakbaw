@@ -16,7 +16,7 @@ import {
 } from '../src/shared/types';
 import { CURRENT_SCHEMA_VERSION, normalizeDigits } from '../src/shared/workflow';
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(process.cwd(), 'data'));
 export const UPLOADS_DIR = path.resolve(DATA_DIR, 'uploads');
 const DB_PATH = path.resolve(DATA_DIR, 'autoparts_erp.sqlite');
 

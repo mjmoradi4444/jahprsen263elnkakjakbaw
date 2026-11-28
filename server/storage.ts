@@ -56,7 +56,7 @@ export function buildStorageResourceUrl(params: {
   return `/api/files/${encodeURIComponent(params.fileId)}`;
 }
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(process.cwd(), 'data'));
 export const LOCAL_UPLOADS_DIR = path.resolve(DATA_DIR, 'uploads');
 fs.mkdirSync(LOCAL_UPLOADS_DIR, { recursive: true });
 

@@ -319,7 +319,7 @@ async function getOcrWorker(): Promise<TesseractWorker> {
       const engDir = path.join(path.dirname(require.resolve('@tesseract.js-data/eng/package.json')), '4.0.0');
       const worker = await createWorker('eng', 1, {
         langPath: engDir,
-        cachePath: path.resolve(process.cwd(), 'data', 'ocr-cache'),
+        cachePath: path.join(path.resolve(process.env.DATA_DIR || path.join(process.cwd(), 'data')), 'ocr-cache'),
         gzip: true,
       });
       await worker.setParameters({
